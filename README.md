@@ -1,6 +1,6 @@
 # Discord VIP Bot
 
-This Discord bot allows users to register their player ID (Steam or Gamepass) and request temporary VIP status for a certain amount of time on connected servers. The bot integrates with an external API to manage VIP status for players and stores player information in a MariaDB database.
+This Discord bot allows users to register their player ID (Steam or Gamepass) and request temporary VIP status for a certain amount of time on connected servers. The bot integrates with an external API to manage VIP status for players and stores player information in a local SQLite database.
 
 ToDo:
 Execute the following commands after downloading:
@@ -13,7 +13,7 @@ Execute the following commands after downloading:
 
 - **Player Registration**: Users can register their player ID (Steam-ID or Gamepass-ID) through a modal window.
 - **VIP Request**: Users can request VIP status for a predefined number of hours. The bot communicates with an external API to grant VIP status.
-- **Persistent Player Data**: Player information is stored in a MariaDB database, allowing for easy retrieval and VIP management.
+- **Persistent Player Data**: Player information is stored in a SQLite database, allowing for easy retrieval and VIP management.
 - **Localized Time Support**: The bot handles time zone conversion to display VIP expiration times in local time (set to Europe/Berlin by default).
   
 ## Prerequisites
