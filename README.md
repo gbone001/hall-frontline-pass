@@ -1,6 +1,6 @@
 # Discord VIP Bot
 
-This Discord bot allows users to register their player ID (Steam or Gamepass) and request temporary VIP status for a certain amount of time on connected servers. The bot integrates with an external API to manage VIP status for players and stores player information in a local SQLite database.
+This Discord bot allows users to register their player ID (Steam or Gamepass) and request temporary VIP status for a certain amount of time on connected Hell Let Loose servers. The bot connects directly to the Hell Let Loose RCON V2 interface to manage VIP status for players and stores player information in a MySQL database.
 
 ToDo:
 Execute the following commands after downloading:
@@ -12,21 +12,23 @@ Execute the following commands after downloading:
 ## Features
 
 - **Player Registration**: Users can register their player ID (Steam-ID or Gamepass-ID) through a modal window.
-- **VIP Request**: Users can request VIP status for a predefined number of hours. The bot communicates with an external API to grant VIP status.
-- **Persistent Player Data**: Player information is stored in a SQLite database, allowing for easy retrieval and VIP management.
+- **VIP Request**: Users can request VIP status for a predefined number of hours. The bot communicates with the Hell Let Loose RCON V2 protocol to grant VIP status.
+- **Persistent Player Data**: Player information is stored in a MySQL database, allowing for easy retrieval and VIP management.
 - **Localized Time Support**: The bot handles time zone conversion to display VIP expiration times in local time (set to Europe/Berlin by default).
   
 ## Prerequisites
 
 - Python 3.8+
 - Discord account and server where the bot will be used
-- API endpoint to manage VIP status
+- Access to the Hell Let Loose RCON V2 endpoint (hostname/IP, port, and RCON password)
+- MySQL instance to store Discord ⇔ player ID mappings
 - `.env` file with the following keys:
   - `DISCORD_TOKEN`: Your Discord bot token
-  - `API_URL`: The URL of the VIP management API
-  - `API_KEY`: The API key for authentication
   - `VIP_DURATION_HOURS`: Duration of the VIP status in hours
   - `CHANNEL_ID`: The ID of the Discord channel where the bot will post the initial message
+  - `LOCAL_TIMEZONE`: IANA time zone identifier used for display (e.g. `Europe/Berlin`)
+  - `DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_USER`, `DATABASE_PASSWORD`, `DATABASE_NAME`, `DATABASE_TABLE`: MySQL connection details
+  - `RCON_HOST`, `RCON_PORT`, `RCON_PASSWORD` (and optionally `RCON_VERSION`): Hell Let Loose RCON V2 connection details
 
 ## Installation
 
@@ -44,10 +46,21 @@ Execute the following commands after downloading:
 3. Create a `.env` file in the root directory with the following content:
     ```bash
     DISCORD_TOKEN=your-discord-bot-token
-    API_URL=https://your-api-endpoint.com
-    API_KEY=your-api-key
     VIP_DURATION_HOURS=24  # Example: 24 hours of VIP
     CHANNEL_ID=your-discord-channel-id
+    LOCAL_TIMEZONE=Europe/Berlin
+
+    DATABASE_HOST=localhost
+    DATABASE_PORT=3306
+    DATABASE_USER=db-user
+    DATABASE_PASSWORD=db-password
+    DATABASE_NAME=frontline
+    DATABASE_TABLE=vip_players
+
+    RCON_HOST=127.0.0.1
+    RCON_PORT=21115
+    RCON_PASSWORD=your-rcon-password
+    RCON_VERSION=2
     ```
 
 4. Run the bot:
@@ -59,15 +72,14 @@ Execute the following commands after downloading:
 
 1. **Registering Player ID**: Once the bot is running, it will post a message in the specified Discord channel with two buttons. To register, users click the "Register" button and enter their player ID (Steam or Gamepass).
    
-2. **Requesting VIP Status**: After registration, users can request VIP status by clicking the "Get VIP" button. The bot will send a request to the connected API to grant the user VIP status for the configured duration (in hours).
+2. **Requesting VIP Status**: After registration, users can request VIP status by clicking the "Get VIP" button. The bot performs the RCON V2 `AddVip` command against the configured server(s) to grant the user VIP status for the configured duration.
 
 3. **VIP Expiration**: The bot will display the expiration time of the VIP status in the local time zone (Europe/Berlin by default).
 
 ## Dependencies
 
 - `discord.py`: For Discord bot functionality
-- `sqlite3`: For local database management
-- `requests`: For sending API requests
+- `mysql-connector-python`: For MySQL database management
 - `pytz`: For time zone management
 - `dotenv`: For loading environment variables
 

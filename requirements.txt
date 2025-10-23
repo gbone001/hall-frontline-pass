@@ -2,4 +2,3 @@ discord.py
 mysql-connector-python
 pytz
 python-dotenv
-requests
