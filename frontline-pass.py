@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-VIP_DURATION_HOURS = int(os.getenv("VIP_DURATION_HOURS"))
+VIP_DURATION_HOURS = float(os.getenv("VIP_DURATION_HOURS"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 LOCAL_TIMEZONE = pytz.timezone(os.getenv('LOCAL_TIMEZONE'))
 RCON_HOST = os.getenv("RCON_HOST")
