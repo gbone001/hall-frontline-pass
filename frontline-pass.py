@@ -4,12 +4,12 @@ import json
 import logging
 import os
 import socket
+import sqlite3
 import struct
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple, Union
 
 import discord
-import mysql.connector
 import pytz
 from discord import ButtonStyle
 from discord.ext import commands
@@ -25,28 +25,67 @@ RCON_HOST = os.getenv("RCON_HOST")
 RCON_PORT = os.getenv("RCON_PORT")
 RCON_PASSWORD = os.getenv("RCON_PASSWORD")
 RCON_VERSION = int(os.getenv("RCON_VERSION", "2"))
+DATABASE_PATH = os.getenv("DATABASE_PATH", "frontline-pass.db")
 
-conn = mysql.connector.connect(
-    host=os.getenv('DATABASE_HOST'),
-    port=int(os.getenv('DATABASE_PORT')),
-    user=os.getenv('DATABASE_USER'),
-    password=os.getenv('DATABASE_PASSWORD'),
-    database=os.getenv('DATABASE_NAME')
-)
-cursor = conn.cursor()
 logging.basicConfig(level=logging.INFO)
-cursor.execute(f'''
-    CREATE TABLE IF NOT EXISTS `{os.getenv('DATABASE_TABLE')}` (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        discord_id VARCHAR(255) UNIQUE NOT NULL,
-        steam_id VARCHAR(255) UNIQUE NOT NULL
-    )
-''')
 
-conn.commit()
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+
+class Database:
+    def __init__(self) -> None:
+        self.table = (os.getenv("DATABASE_TABLE") or "vip_players").strip()
+        if not self.table:
+            raise ValueError("DATABASE_TABLE must not be empty.")
+        self._identifier = self._quote_identifier(self.table)
+        self._conn = sqlite3.connect(
+            DATABASE_PATH,
+            detect_types=sqlite3.PARSE_DECLTYPES,
+            check_same_thread=False,
+        )
+        self._initialise_schema()
+
+    def _quote_identifier(self, name: str) -> str:
+        if any(ch in name for ch in ('`', '"', "'", ";")):
+            raise ValueError("Invalid characters in table name.")
+        return f'"{name}"'
+
+    def _initialise_schema(self) -> None:
+        self._conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {self._identifier} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discord_id TEXT UNIQUE NOT NULL,
+                steam_id TEXT UNIQUE NOT NULL
+            )
+            """
+        )
+        self._conn.commit()
+
+    def upsert_player(self, discord_id: str, steam_id: str) -> None:
+        try:
+            self._conn.execute(
+                f"""
+                INSERT INTO {self._identifier} (discord_id, steam_id)
+                VALUES (?, ?)
+                ON CONFLICT(discord_id) DO UPDATE SET steam_id=excluded.steam_id
+                """,
+                (discord_id, steam_id),
+            )
+            self._conn.commit()
+        except sqlite3.IntegrityError:
+            # Ignore conflicts on steam_id to mirror previous behaviour.
+            pass
+
+    def fetch_player(self, discord_id: str) -> Optional[str]:
+        cursor = self._conn.execute(
+            f"SELECT steam_id FROM {self._identifier} WHERE discord_id = ?",
+            (discord_id,),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+
+database = Database()
+bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
 
 
 class RconError(Exception):
@@ -264,9 +303,8 @@ class PlayerIDModal(Modal):
         self.add_item(self.player_id)
     
     async def on_submit(self, interaction: discord.Interaction):
-        steam_id = self.player_id.value
-        cursor.execute(f"INSERT INTO `{os.getenv('DATABASE_TABLE')}` (discord_id, steam_id) VALUES (%s, %s) ON DUPLICATE KEY UPDATE steam_id = %s", (str(interaction.user.id), steam_id, steam_id))
-        conn.commit()
+        steam_id = self.player_id.value.strip()
+        database.upsert_player(str(interaction.user.id), steam_id)
         await interaction.response.send_message(f'Your Player-ID {steam_id} has been saved!', ephemeral=True)
 
 class CombinedView(View):
@@ -280,14 +318,11 @@ class CombinedView(View):
 
     @discord.ui.button(label=f"get VIP ({VIP_DURATION_HOURS} hours)", style=ButtonStyle.green)
     async def give_vip_button(self, interaction: discord.Interaction, button: Button):
-        cursor.execute(f"SELECT steam_id FROM `{os.getenv('DATABASE_TABLE')}` WHERE discord_id=%s", (str(interaction.user.id),))
-        player = cursor.fetchone()
+        steam_id = database.fetch_player(str(interaction.user.id))
 
-        if not player:
+        if not steam_id:
             await interaction.response.send_message("You are not registered! Please use the register button first.", ephemeral=True)
             return
-
-        steam_id = str(player[0])
         local_time = datetime.now(LOCAL_TIMEZONE)
         expiration_time_local = local_time + timedelta(hours=VIP_DURATION_HOURS)
         expiration_time_utc = expiration_time_local.astimezone(pytz.utc)

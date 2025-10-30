@@ -1,6 +1,6 @@
 # Discord VIP Bot
 
-This Discord bot allows users to register their player ID (Steam or Gamepass) and request temporary VIP status for a certain amount of time on connected Hell Let Loose servers. The bot connects directly to the Hell Let Loose RCON V2 interface to manage VIP status for players and stores player information in a MySQL database.
+This Discord bot allows users to register their player ID (Steam or Gamepass) and request temporary VIP status for a certain amount of time on connected Hell Let Loose servers. The bot connects directly to the Hell Let Loose RCON V2 interface to manage VIP status for players and stores player information in a local SQLite database.
 
 ToDo:
 Execute the following commands after downloading:
@@ -13,7 +13,7 @@ Execute the following commands after downloading:
 
 - **Player Registration**: Users can register their player ID (Steam-ID or Gamepass-ID) through a modal window.
 - **VIP Request**: Users can request VIP status for a predefined number of hours. The bot communicates with the Hell Let Loose RCON V2 protocol to grant VIP status.
-- **Persistent Player Data**: Player information is stored in a MySQL database, allowing for easy retrieval and VIP management.
+- **Persistent Player Data**: Player information is stored in a SQLite database, allowing for easy retrieval and VIP management.
 - **Localized Time Support**: The bot handles time zone conversion to display VIP expiration times in local time (set to Europe/Berlin by default).
   
 ## Prerequisites
@@ -21,13 +21,13 @@ Execute the following commands after downloading:
 - Python 3.8+
 - Discord account and server where the bot will be used
 - Access to the Hell Let Loose RCON V2 endpoint (hostname/IP, port, and RCON password)
-- MySQL instance to store Discord ⇔ player ID mappings
+- Local filesystem access to store the SQLite database file
 - `.env` file with the following keys:
   - `DISCORD_TOKEN`: Your Discord bot token
   - `VIP_DURATION_HOURS`: Duration of the VIP status in hours
   - `CHANNEL_ID`: The ID of the Discord channel where the bot will post the initial message
   - `LOCAL_TIMEZONE`: IANA time zone identifier used for display (e.g. `Europe/Berlin`)
-  - `DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_USER`, `DATABASE_PASSWORD`, `DATABASE_NAME`, `DATABASE_TABLE`: MySQL connection details
+  - `DATABASE_PATH`: SQLite file path (defaults to `frontline-pass.db`)
   - `RCON_HOST`, `RCON_PORT`, `RCON_PASSWORD` (and optionally `RCON_VERSION`): Hell Let Loose RCON V2 connection details
 
 ## Installation
@@ -50,12 +50,7 @@ Execute the following commands after downloading:
     CHANNEL_ID=your-discord-channel-id
     LOCAL_TIMEZONE=Europe/Berlin
 
-    DATABASE_HOST=localhost
-    DATABASE_PORT=3306
-    DATABASE_USER=db-user
-    DATABASE_PASSWORD=db-password
-    DATABASE_NAME=frontline
-    DATABASE_TABLE=vip_players
+    DATABASE_PATH=frontline-pass.db
 
     RCON_HOST=127.0.0.1
     RCON_PORT=21115
@@ -79,7 +74,6 @@ Execute the following commands after downloading:
 ## Dependencies
 
 - `discord.py`: For Discord bot functionality
-- `mysql-connector-python`: For MySQL database management
 - `pytz`: For time zone management
 - `dotenv`: For loading environment variables
 
