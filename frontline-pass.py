@@ -565,70 +565,78 @@ def create_database(config: AppConfig) -> Database:
     return Database(config.database_path, config.database_table)
 
 
-def create_bot(config: AppConfig, database: Database, vip_service: VipService) -> commands.Bot:
-    intents = discord.Intents.default()
-    bot = commands.Bot(command_prefix="!", intents=intents)
-    notifier = ModeratorNotifier(config)
-    persistent_view = CombinedView(config, database, vip_service, notifier)
+class FrontlinePassBot(commands.Bot):
+    def __init__(self, config: AppConfig, database: Database, vip_service: VipService) -> None:
+        intents = discord.Intents.default()
+        super().__init__(command_prefix="!", intents=intents)
+        self.config = config
+        self.database = database
+        self.vip_service = vip_service
+        self.notifier = ModeratorNotifier(config)
+        self.persistent_view: Optional[CombinedView] = None
 
-    bot.config = config  # type: ignore[attr-defined]
-    bot.database = database  # type: ignore[attr-defined]
-    bot.vip_service = vip_service  # type: ignore[attr-defined]
-    bot.notifier = notifier  # type: ignore[attr-defined]
-    bot.persistent_view = persistent_view  # type: ignore[attr-defined]
+    async def setup_hook(self) -> None:
+        self.persistent_view = CombinedView(self.config, self.database, self.vip_service, self.notifier)
+        self.add_view(self.persistent_view)
 
-    bot.add_view(persistent_view)
+    async def on_ready(self) -> None:
+        logging.info("Bot is ready: %s", self.user)
+        await self.ensure_announcement_message()
 
-    @bot.event
-    async def on_ready() -> None:
-        logging.info("Bot is ready: %s", bot.user)
-        destination = bot.get_channel(config.channel_id)
+    async def ensure_announcement_message(self) -> None:
+        if not self.persistent_view:
+            logging.error("Persistent view not initialised; cannot attach announcement message.")
+            return
+
+        destination = self.get_channel(self.config.channel_id)
         if destination is None:
             try:
-                destination = await bot.fetch_channel(config.channel_id)
+                destination = await self.fetch_channel(self.config.channel_id)
             except discord.DiscordException:
-                logging.exception("Failed to access channel with id %s", config.channel_id)
+                logging.exception("Failed to access channel with id %s", self.config.channel_id)
                 return
 
         if not isinstance(destination, (discord.TextChannel, discord.Thread, discord.DMChannel)):
-            logging.error("Channel %s is not a text-based destination.", config.channel_id)
+            logging.error("Channel %s is not a text-based destination.", self.config.channel_id)
             return
 
         message_content = (
             "Welcome! Use the buttons below to register your player ID and receive VIP status on all connected servers. "
-            f"You only need to register once, but afterward, you can claim temporary VIP status for {config.vip_duration_label} hours."
+            f"You only need to register once, but afterward, you can claim temporary VIP status for {self.config.vip_duration_label} hours."
         )
 
         message = None
-        if config.announcement_message_id:
+        if self.config.announcement_message_id:
             try:
-                message = await destination.fetch_message(config.announcement_message_id)
+                message = await destination.fetch_message(self.config.announcement_message_id)
             except discord.NotFound:
                 logging.warning(
                     "Configured ANNOUNCEMENT_MESSAGE_ID %s was not found in channel %s.",
-                    config.announcement_message_id,
-                    config.channel_id,
+                    self.config.announcement_message_id,
+                    self.config.channel_id,
                 )
             except discord.DiscordException:
-                logging.exception("Failed to fetch configured announcement message %s", config.announcement_message_id)
+                logging.exception("Failed to fetch configured announcement message %s", self.config.announcement_message_id)
 
         if message is None:
             async for candidate in destination.history(limit=50):
-                if candidate.author == bot.user:
+                if candidate.author == self.user:
                     message = candidate
                     break
 
         if message:
-            await message.edit(content=message_content, view=persistent_view)
+            await message.edit(content=message_content, view=self.persistent_view)
             logging.info("Reattached control view to existing message %s", message.id)
         else:
-            sent_message = await destination.send(message_content, view=persistent_view)
+            sent_message = await destination.send(message_content, view=self.persistent_view)
             logging.info(
                 "Posted new announcement message with id %s. Set ANNOUNCEMENT_MESSAGE_ID to reuse it on future restarts.",
                 sent_message.id,
             )
 
-    return bot
+
+def create_bot(config: AppConfig, database: Database, vip_service: VipService) -> commands.Bot:
+    return FrontlinePassBot(config, database, vip_service)
 
 
 def main() -> None:
