@@ -14,6 +14,7 @@ Execute the following commands after downloading:
 - **Player Registration**: Users can register their player ID (Steam-ID or Gamepass-ID) through a modal window.
 - **VIP Request**: Users can request VIP status for a predefined number of hours. The bot communicates with the Hell Let Loose RCON V2 protocol to grant VIP status.
 - **Persistent Player Data**: Player information is stored in a SQLite database, allowing for easy retrieval and VIP management.
+- **Persistent Controls**: The bot posts an embed with persistent buttons that survive restarts, can be refreshed with a slash command, and show live statistics (registered players, last VIP grant).
 - **Duplicate Protection**: Attempts to reuse an existing Player-ID trigger an in-app warning and notify moderators so they can investigate.
 - **Localized Time Support**: The bot handles time zone conversion to display VIP expiration times in local time (set to Europe/Berlin by default).
   
@@ -33,6 +34,7 @@ Execute the following commands after downloading:
   - `ANNOUNCEMENT_MESSAGE_ID`: (Optional) Existing message ID to re-use on startup
   - `MODERATION_CHANNEL_ID`: (Optional) Channel to notify when duplicate Player-IDs are attempted
   - `MODERATOR_ROLE_ID`: (Optional) Role to @mention when sending moderator notifications
+  - `CRCON_HTTP_BASE_URL`, `CRCON_HTTP_USERNAME`, `CRCON_HTTP_PASSWORD`: (Optional) Enable the CRCON HTTP API integration for faster VIP provisioning before falling back to RCON
   - `RCON_HOST`, `RCON_PORT`, `RCON_PASSWORD` (and optionally `RCON_VERSION`): Hell Let Loose RCON V2 connection details
   
 The bot validates these settings on startup and exits with a clear error message if any required value is missing or invalid.
@@ -63,6 +65,9 @@ The bot validates these settings on startup and exits with a clear error message
     ANNOUNCEMENT_MESSAGE_ID=
     MODERATION_CHANNEL_ID=
     MODERATOR_ROLE_ID=
+    CRCON_HTTP_BASE_URL=
+    CRCON_HTTP_USERNAME=
+    CRCON_HTTP_PASSWORD=
 
     RCON_HOST=127.0.0.1
     RCON_PORT=21115
@@ -104,11 +109,14 @@ You can tail logs with `railway logs` once the service is running.
 
 4. **Duplicate Player-IDs**: If a user reuses an existing Player-ID, the bot blocks the update, informs the user, and (optionally) alerts moderators in the configured channel.
 
+5. **Admin Controls**: Administrators can run `/repost_frontline_controls` to delete and re-post the persistent embed if needed. The bot also refreshes the embed automatically after each successful VIP grant and stores the announcement message ID in SQLite for future restarts.
+
 ## Dependencies
 
 - `discord.py`: For Discord bot functionality
 - `pytz`: For time zone management
 - `dotenv`: For loading environment variables
+- `requests`: For optional CRCON HTTP API support
 
 ## Contributing
 

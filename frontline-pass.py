@@ -6,18 +6,24 @@ import os
 import socket
 import sqlite3
 import struct
+import requests
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, Tuple, Union
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import discord
 import pytz
 from discord import ButtonStyle
+from discord.abc import MessageableChannel
 from discord.ext import commands
 from discord.ui import Button, Modal, TextInput, View
 from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO)
+
+ANNOUNCEMENT_TITLE = "Frontline VIP Control Center"
+ANNOUNCEMENT_METADATA_KEY = "announcement_message_id"
+LAST_GRANT_METADATA_KEY = "last_vip_grant"
 
 
 class DuplicateSteamIDError(Exception):
@@ -25,6 +31,142 @@ class DuplicateSteamIDError(Exception):
         super().__init__(f"Player-ID {steam_id} already registered.")
         self.steam_id = steam_id
         self.existing_discord_id = existing_discord_id
+
+
+def build_announcement_embed(config: AppConfig, database: "Database") -> discord.Embed:
+    total_players = database.count_players()
+    last_grant_text = "No VIP grants yet."
+    last_grant_value = database.get_metadata(LAST_GRANT_METADATA_KEY)
+    if last_grant_value:
+        try:
+            last_grant_dt = datetime.fromisoformat(last_grant_value)
+            if last_grant_dt.tzinfo is None:
+                last_grant_dt = last_grant_dt.replace(tzinfo=timezone.utc)
+            local_dt = last_grant_dt.astimezone(config.timezone)
+            last_grant_text = local_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+        except ValueError:
+            last_grant_text = "Unknown"
+
+    embed = discord.Embed(
+        title=ANNOUNCEMENT_TITLE,
+        description=(
+            "Use the buttons below to register your Player-ID and request VIP access.\n"
+            f"VIP duration: **{config.vip_duration_label} hours**.\n"
+            "Registration is required once; future VIP requests are instant."
+        ),
+        color=0x2F3136,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Registered Players", value=str(total_players), inline=True)
+    embed.add_field(name="Last VIP Grant", value=last_grant_text, inline=True)
+    embed.add_field(name="Local Timezone", value=config.timezone_name, inline=True)
+    embed.set_footer(text="Buttons stay active across restarts.")
+    return embed
+
+
+class AnnouncementManager:
+    def __init__(self, config: AppConfig, database: "Database") -> None:
+        self._config = config
+        self._database = database
+
+    async def ensure(
+        self,
+        bot: commands.Bot,
+        view: View,
+        *,
+        force_new: bool = False,
+    ) -> Optional[discord.Message]:
+        destination = await self._resolve_destination(bot)
+        if destination is None:
+            return None
+
+        embed = build_announcement_embed(self._config, self._database)
+        message = await self._locate_message(destination, bot, force_new=force_new)
+
+        if message and not force_new:
+            await message.edit(embed=embed, view=view)
+            self._store_message_id(message.id)
+            logging.info("Reattached control view to existing message %s", message.id)
+            return message
+
+        sent_message = await destination.send(embed=embed, view=view)
+        self._store_message_id(sent_message.id)
+        logging.info(
+            "Posted announcement message with id %s. Metadata updated for future restarts.",
+            sent_message.id,
+        )
+        return sent_message
+
+    async def _resolve_destination(self, bot: commands.Bot) -> Optional[MessageableChannel]:
+        destination = bot.get_channel(self._config.channel_id)
+        if destination is None:
+            try:
+                destination = await bot.fetch_channel(self._config.channel_id)
+            except discord.DiscordException:
+                logging.exception("Failed to access channel with id %s", self._config.channel_id)
+                return None
+
+        if not isinstance(destination, (discord.TextChannel, discord.Thread, discord.DMChannel)):
+            logging.error("Channel %s is not a text-based destination.", self._config.channel_id)
+            return None
+
+        return destination
+
+    async def _locate_message(
+        self,
+        destination: MessageableChannel,
+        bot: commands.Bot,
+        *,
+        force_new: bool,
+    ) -> Optional[discord.Message]:
+        candidate_ids = self._candidate_message_ids()
+        for candidate_id in candidate_ids:
+            try:
+                message = await destination.fetch_message(candidate_id)
+                if force_new:
+                    await self._delete_message(message)
+                    return None
+                return message
+            except discord.NotFound:
+                self._maybe_clear_metadata(candidate_id)
+            except discord.DiscordException:
+                logging.exception("Failed to fetch announcement message %s", candidate_id)
+
+        async for message in destination.history(limit=50):
+            if message.author == bot.user and message.embeds:
+                if message.embeds[0].title == ANNOUNCEMENT_TITLE:
+                    if force_new:
+                        await self._delete_message(message)
+                        return None
+                    return message
+        return None
+
+    async def _delete_message(self, message: discord.Message) -> None:
+        try:
+            await message.delete()
+        except discord.DiscordException:
+            logging.exception("Failed to delete announcement message %s", message.id)
+
+    def _candidate_message_ids(self) -> List[int]:
+        candidate_ids: List[int] = []
+        stored_message_id = self._database.get_metadata(ANNOUNCEMENT_METADATA_KEY)
+        if stored_message_id:
+            try:
+                candidate_ids.append(int(stored_message_id))
+            except ValueError:
+                self._database.delete_metadata(ANNOUNCEMENT_METADATA_KEY)
+
+        if self._config.announcement_message_id:
+            candidate_ids.append(self._config.announcement_message_id)
+        return candidate_ids
+
+    def _maybe_clear_metadata(self, candidate_id: int) -> None:
+        stored_message_id = self._database.get_metadata(ANNOUNCEMENT_METADATA_KEY)
+        if stored_message_id and stored_message_id == str(candidate_id):
+            self._database.delete_metadata(ANNOUNCEMENT_METADATA_KEY)
+
+    def _store_message_id(self, message_id: int) -> None:
+        self._database.set_metadata(ANNOUNCEMENT_METADATA_KEY, str(message_id))
 
 
 def _resolve_database_path(explicit_path: Optional[str]) -> str:
@@ -56,6 +198,13 @@ def _optional_int(name: str) -> Optional[int]:
 
 
 @dataclass(frozen=True)
+class HttpCredentials:
+    base_url: str
+    username: str
+    password: str
+
+
+@dataclass(frozen=True)
 class AppConfig:
     discord_token: str
     vip_duration_hours: float
@@ -71,6 +220,7 @@ class AppConfig:
     moderation_channel_id: Optional[int]
     moderator_role_id: Optional[int]
     announcement_message_id: Optional[int]
+    http_credentials: Optional[HttpCredentials]
 
     @property
     def vip_duration_label(self) -> str:
@@ -139,6 +289,29 @@ def load_config() -> AppConfig:
     moderator_role_id = _optional_int("MODERATOR_ROLE_ID")
     announcement_message_id = _optional_int("ANNOUNCEMENT_MESSAGE_ID")
 
+    http_base_url = os.getenv("CRCON_HTTP_BASE_URL")
+    http_username = os.getenv("CRCON_HTTP_USERNAME")
+    http_password = os.getenv("CRCON_HTTP_PASSWORD")
+    http_credentials: Optional[HttpCredentials] = None
+
+    provided_http_values = [http_base_url, http_username, http_password]
+    if any(provided_http_values):
+        trimmed_base = (http_base_url or "").strip()
+        trimmed_user = (http_username or "").strip()
+        if not trimmed_base:
+            errors.append("CRCON_HTTP_BASE_URL is required when using the HTTP API integration")
+        if not trimmed_user:
+            errors.append("CRCON_HTTP_USERNAME is required when using the HTTP API integration")
+        if http_password is None:
+            errors.append("CRCON_HTTP_PASSWORD is required when using the HTTP API integration")
+
+        if trimmed_base and trimmed_user and http_password is not None:
+            http_credentials = HttpCredentials(
+                base_url=trimmed_base.rstrip("/"),
+                username=trimmed_user,
+                password=http_password,
+            )
+
     if errors:
         raise RuntimeError("Configuration error(s): " + "; ".join(errors))
 
@@ -157,6 +330,7 @@ def load_config() -> AppConfig:
         moderation_channel_id=moderation_channel_id,
         moderator_role_id=moderator_role_id,
         announcement_message_id=announcement_message_id,
+        http_credentials=http_credentials,
     )
 
 
@@ -197,6 +371,14 @@ class Database:
             )
             """
         )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vip_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
         self._conn.commit()
 
     def upsert_player(self, discord_id: str, steam_id: str) -> None:
@@ -232,6 +414,39 @@ class Database:
         )
         row = cursor.fetchone()
         return row[0] if row else None
+
+    def set_metadata(self, key: str, value: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO vip_metadata (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, value),
+        )
+        self._conn.commit()
+
+    def get_metadata(self, key: str) -> Optional[str]:
+        cursor = self._conn.execute(
+            "SELECT value FROM vip_metadata WHERE key = ?",
+            (key,),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    def delete_metadata(self, key: str) -> None:
+        self._conn.execute(
+            "DELETE FROM vip_metadata WHERE key = ?",
+            (key,),
+        )
+        self._conn.commit()
+
+    def count_players(self) -> int:
+        cursor = self._conn.execute(
+            f"SELECT COUNT(*) FROM {self._identifier}"
+        )
+        row = cursor.fetchone()
+        return int(row[0] if row else 0)
 
 
 class RconError(Exception):
@@ -419,8 +634,44 @@ class RconClient:
 class VipService:
     def __init__(self, config: AppConfig) -> None:
         self._config = config
+        self._http_client = VipHttpClient(config.http_credentials) if config.http_credentials else None
 
-    def grant_vip(self, player_id: str, comment: str) -> str:
+    def grant_vip(self, player_id: str, comment: str) -> VipGrantResult:
+        status_lines: List[str] = []
+        detail = ""
+        overall_success = False
+
+        if self._http_client:
+            try:
+                response = self._http_client.add_vip(player_id, comment)
+                message = (
+                    response.get("message")
+                    or response.get("StatusMessage")
+                    or response.get("statusMessage")
+                    or "HTTP API add_vip succeeded."
+                )
+                status_lines.append(f"HTTP API: {message}")
+                detail = str(message)
+                overall_success = True
+            except VipHTTPError as exc:
+                status_lines.append(f"HTTP API add_vip failed: {exc}")
+
+        if not overall_success:
+            try:
+                rcon_message = self._grant_vip_via_rcon(player_id, comment)
+                status_lines.append(f"RCON AddVip succeeded: {rcon_message}")
+                detail = rcon_message
+                overall_success = True
+            except RconError as exc:
+                status_lines.append(f"RCON AddVip failed: {exc}")
+                combined = "; ".join(status_lines) if status_lines else str(exc)
+                raise RconError(combined) from exc
+        elif self._http_client:
+            status_lines.append("RCON fallback not required.")
+
+        return VipGrantResult(status_lines=status_lines, detail=detail or "VIP added successfully.")
+
+    def _grant_vip_via_rcon(self, player_id: str, comment: str) -> str:
         with RconClient(
             self._config.rcon_host,
             self._config.rcon_port,
@@ -463,6 +714,77 @@ class ModeratorNotifier:
             logging.exception("Failed to notify moderators about duplicate Player-ID %s", steam_id)
 
 
+class VipHTTPError(Exception):
+    """Raised when the optional HTTP API integration fails."""
+
+
+class VipHttpClient:
+    def __init__(self, credentials: HttpCredentials, timeout: float = 10.0) -> None:
+        self.credentials = credentials
+        self.timeout = timeout
+        self.session = requests.Session()
+        self._token: Optional[str] = None
+
+    def login(self) -> str:
+        url = f"{self.credentials.base_url}/login"
+        payload = {"username": self.credentials.username, "password": self.credentials.password}
+        response = self.session.post(url, json=payload, timeout=self.timeout)
+        if response.status_code != 200:
+            raise VipHTTPError(f"Login failed with status {response.status_code}: {response.text}")
+
+        data = self._parse_json(response)
+        token = data.get("result") or data.get("token") or data.get("access_token")
+        if not token:
+            raise VipHTTPError("Login response did not include an access token.")
+        self._token = token
+        return token
+
+    def add_vip(self, player_id: str, comment: str) -> Dict[str, Any]:
+        if not self._token:
+            self.login()
+
+        url = f"{self.credentials.base_url}/add_vip"
+        payload = {"player_id": player_id, "comment": comment}
+        response = self.session.post(url, headers=self._auth_headers(), json=payload, timeout=self.timeout)
+
+        if response.status_code == 401:
+            self._token = None
+            self.login()
+            response = self.session.post(url, headers=self._auth_headers(), json=payload, timeout=self.timeout)
+
+        if response.status_code != 200:
+            raise VipHTTPError(f"add_vip failed with status {response.status_code}: {response.text}")
+
+        data = self._parse_json(response)
+        if isinstance(data, dict) and data.get("failed"):
+            raise VipHTTPError(f"add_vip reported failure: {data.get('error') or data}")
+        return data
+
+    def _auth_headers(self) -> Dict[str, str]:
+        if not self._token:
+            raise VipHTTPError("Missing bearer token; call login() first.")
+        return {
+            "Authorization": f"Bearer {self._token}",
+            "Accept": "application/json",
+        }
+
+    @staticmethod
+    def _parse_json(response: requests.Response) -> Dict[str, Any]:
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise VipHTTPError(f"Failed to parse JSON response: {response.text}") from exc
+        if isinstance(data, dict):
+            return data
+        raise VipHTTPError("Unexpected response format; expected JSON object.")
+
+
+@dataclass
+class VipGrantResult:
+    status_lines: List[str]
+    detail: str
+
+
 class PlayerIDModal(Modal):
     def __init__(self, database: Database, notifier: ModeratorNotifier):
         super().__init__(title="Please input Player-ID", custom_id="frontline-pass-player-id-modal")
@@ -502,9 +824,14 @@ class PlayerIDModal(Modal):
         await interaction.response.send_message(message, ephemeral=True)
 
 
-class CombinedView(View):
-    def __init__(self, config: AppConfig, database: Database, vip_service: VipService, notifier: ModeratorNotifier) -> None:
+class PersistentView(View):
+    def __init__(self) -> None:
         super().__init__(timeout=None)
+
+
+class CombinedView(PersistentView):
+    def __init__(self, config: AppConfig, database: Database, vip_service: VipService, notifier: ModeratorNotifier) -> None:
+        super().__init__()
         self.config = config
         self.database = database
         self.vip_service = vip_service
@@ -534,7 +861,7 @@ class CombinedView(View):
 
         await interaction.response.defer(ephemeral=True)
         try:
-            status_message = await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 self.vip_service.grant_vip,
                 steam_id,
                 comment,
@@ -553,10 +880,17 @@ class CombinedView(View):
             "Granted VIP for player %s until %s UTC (%s)",
             steam_id,
             expiration_time_utc_str,
-            status_message,
+            "; ".join(result.status_lines),
         )
+        self.database.set_metadata(LAST_GRANT_METADATA_KEY, datetime.now(timezone.utc).isoformat())
+        if isinstance(interaction.client, FrontlinePassBot):
+            await interaction.client.refresh_announcement_message()
+        status_summary = "\n".join(f"- {line}" for line in result.status_lines)
         await interaction.followup.send(
-            f"You now have VIP for {self.config.vip_duration_label} hours! Expiration: {readable_expiration}",
+            (
+                f"You now have VIP for {self.config.vip_duration_label} hours! "
+                f"Expiration: {readable_expiration}\n\n**Status**:\n{status_summary}"
+            ),
             ephemeral=True,
         )
 
@@ -574,65 +908,61 @@ class FrontlinePassBot(commands.Bot):
         self.vip_service = vip_service
         self.notifier = ModeratorNotifier(config)
         self.persistent_view: Optional[CombinedView] = None
+        self.announcement_manager = AnnouncementManager(config, database)
 
     async def setup_hook(self) -> None:
         self.persistent_view = CombinedView(self.config, self.database, self.vip_service, self.notifier)
         self.add_view(self.persistent_view)
+        await self._register_commands()
+        await self.tree.sync()
 
     async def on_ready(self) -> None:
         logging.info("Bot is ready: %s", self.user)
-        await self.ensure_announcement_message()
+        await self.refresh_announcement_message()
 
-    async def ensure_announcement_message(self) -> None:
+    async def refresh_announcement_message(self) -> None:
         if not self.persistent_view:
-            logging.error("Persistent view not initialised; cannot attach announcement message.")
+            logging.error("Persistent view not initialised; cannot refresh announcement message.")
             return
+        await self.announcement_manager.ensure(self, self.persistent_view)
 
-        destination = self.get_channel(self.config.channel_id)
-        if destination is None:
-            try:
-                destination = await self.fetch_channel(self.config.channel_id)
-            except discord.DiscordException:
-                logging.exception("Failed to access channel with id %s", self.config.channel_id)
+    async def _register_commands(self) -> None:
+        @self.tree.command(
+            name="repost_frontline_controls",
+            description="Repost the Frontline VIP control panel.",
+        )
+        async def repost_frontline_controls(interaction: discord.Interaction) -> None:
+            permissions = getattr(interaction.user, "guild_permissions", None)  # type: ignore[attr-defined]
+            if not permissions or not permissions.administrator:
+                await interaction.response.send_message(
+                    "You need administrator permissions to use this command.",
+                    ephemeral=True,
+                )
                 return
 
-        if not isinstance(destination, (discord.TextChannel, discord.Thread, discord.DMChannel)):
-            logging.error("Channel %s is not a text-based destination.", self.config.channel_id)
-            return
-
-        message_content = (
-            "Welcome! Use the buttons below to register your player ID and receive VIP status on all connected servers. "
-            f"You only need to register once, but afterward, you can claim temporary VIP status for {self.config.vip_duration_label} hours."
-        )
-
-        message = None
-        if self.config.announcement_message_id:
-            try:
-                message = await destination.fetch_message(self.config.announcement_message_id)
-            except discord.NotFound:
-                logging.warning(
-                    "Configured ANNOUNCEMENT_MESSAGE_ID %s was not found in channel %s.",
-                    self.config.announcement_message_id,
-                    self.config.channel_id,
+            await interaction.response.defer(ephemeral=True)
+            if not self.persistent_view:
+                await interaction.followup.send(
+                    "The persistent view is not initialised yet. Try again shortly.",
+                    ephemeral=True,
                 )
-            except discord.DiscordException:
-                logging.exception("Failed to fetch configured announcement message %s", self.config.announcement_message_id)
+                return
 
-        if message is None:
-            async for candidate in destination.history(limit=50):
-                if candidate.author == self.user:
-                    message = candidate
-                    break
-
-        if message:
-            await message.edit(content=message_content, view=self.persistent_view)
-            logging.info("Reattached control view to existing message %s", message.id)
-        else:
-            sent_message = await destination.send(message_content, view=self.persistent_view)
-            logging.info(
-                "Posted new announcement message with id %s. Set ANNOUNCEMENT_MESSAGE_ID to reuse it on future restarts.",
-                sent_message.id,
+            message = await self.announcement_manager.ensure(
+                self,
+                self.persistent_view,
+                force_new=True,
             )
+            if message:
+                await interaction.followup.send(
+                    f"Frontline VIP controls reposted successfully (message ID {message.id}).",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    "Unable to repost the VIP controls. Check the bot logs for details.",
+                    ephemeral=True,
+                )
 
 
 def create_bot(config: AppConfig, database: Database, vip_service: VipService) -> commands.Bot:
