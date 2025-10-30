@@ -6,6 +6,7 @@ import os
 import socket
 import sqlite3
 import struct
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -16,37 +17,175 @@ from discord.ext import commands
 from discord.ui import Button, Modal, TextInput, View
 from dotenv import load_dotenv
 
-load_dotenv()
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-VIP_DURATION_HOURS = float(os.getenv("VIP_DURATION_HOURS"))
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
-LOCAL_TIMEZONE = pytz.timezone(os.getenv('LOCAL_TIMEZONE'))
-RCON_HOST = os.getenv("RCON_HOST")
-RCON_PORT = os.getenv("RCON_PORT")
-RCON_PASSWORD = os.getenv("RCON_PASSWORD")
-RCON_VERSION = int(os.getenv("RCON_VERSION", "2"))
-DATABASE_PATH = os.getenv("DATABASE_PATH", "frontline-pass.db")
-
 logging.basicConfig(level=logging.INFO)
 
 
+class DuplicateSteamIDError(Exception):
+    def __init__(self, steam_id: str, existing_discord_id: Optional[str]) -> None:
+        super().__init__(f"Player-ID {steam_id} already registered.")
+        self.steam_id = steam_id
+        self.existing_discord_id = existing_discord_id
+
+
+def _resolve_database_path(explicit_path: Optional[str]) -> str:
+    if explicit_path:
+        return explicit_path
+
+    fallback_dirs = [
+        os.getenv("RAILWAY_VOLUME_MOUNT_PATH"),
+        os.getenv("RAILWAY_VOLUME_DIR"),
+        os.getenv("RAILWAY_DATA_DIR"),
+        os.getenv("DATA_DIR"),
+    ]
+
+    for base_dir in fallback_dirs:
+        if base_dir:
+            return os.path.join(base_dir, "frontline-pass.db")
+
+    return "frontline-pass.db"
+
+
+def _optional_int(name: str) -> Optional[int]:
+    value = os.getenv(name)
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid integer for {name}: {value}") from exc
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    discord_token: str
+    vip_duration_hours: float
+    channel_id: int
+    timezone: pytz.BaseTzInfo
+    timezone_name: str
+    rcon_host: str
+    rcon_port: int
+    rcon_password: str
+    rcon_version: int
+    database_path: str
+    database_table: str
+    moderation_channel_id: Optional[int]
+    moderator_role_id: Optional[int]
+    announcement_message_id: Optional[int]
+
+    @property
+    def vip_duration_label(self) -> str:
+        return f"{self.vip_duration_hours:g}"
+
+
+def load_config() -> AppConfig:
+    load_dotenv()
+    errors = []
+
+    def require(name: str) -> str:
+        value = os.getenv(name)
+        if value is None or not value.strip():
+            errors.append(f"{name} is required")
+            return ""
+        return value.strip()
+
+    discord_token = require("DISCORD_TOKEN")
+    vip_duration_raw = require("VIP_DURATION_HOURS")
+    channel_id_raw = require("CHANNEL_ID")
+    timezone_name = require("LOCAL_TIMEZONE")
+    rcon_host = require("RCON_HOST")
+    rcon_port_raw = require("RCON_PORT")
+    rcon_password = require("RCON_PASSWORD")
+    rcon_version_raw = os.getenv("RCON_VERSION", "2").strip()
+
+    vip_duration_hours = None
+    channel_id = None
+    rcon_port = None
+    rcon_version = None
+
+    try:
+        vip_duration_hours = float(vip_duration_raw)
+        if vip_duration_hours <= 0:
+            errors.append("VIP_DURATION_HOURS must be greater than zero")
+    except ValueError:
+        errors.append(f"VIP_DURATION_HOURS must be a number (got {vip_duration_raw!r})")
+
+    try:
+        channel_id = int(channel_id_raw)
+    except ValueError:
+        errors.append(f"CHANNEL_ID must be an integer (got {channel_id_raw!r})")
+
+    try:
+        timezone = pytz.timezone(timezone_name)
+    except pytz.UnknownTimeZoneError:
+        errors.append(f"LOCAL_TIMEZONE must be a valid IANA timezone (got {timezone_name!r})")
+        timezone = pytz.UTC
+
+    try:
+        rcon_port = int(rcon_port_raw)
+    except ValueError:
+        errors.append(f"RCON_PORT must be an integer (got {rcon_port_raw!r})")
+
+    try:
+        rcon_version = int(rcon_version_raw)
+    except ValueError:
+        errors.append(f"RCON_VERSION must be an integer (got {rcon_version_raw!r})")
+
+    database_table = (os.getenv("DATABASE_TABLE") or "vip_players").strip()
+    if not database_table:
+        errors.append("DATABASE_TABLE must not be empty")
+
+    database_path = _resolve_database_path(os.getenv("DATABASE_PATH"))
+    moderation_channel_id = _optional_int("MODERATION_CHANNEL_ID")
+    moderator_role_id = _optional_int("MODERATOR_ROLE_ID")
+    announcement_message_id = _optional_int("ANNOUNCEMENT_MESSAGE_ID")
+
+    if errors:
+        raise RuntimeError("Configuration error(s): " + "; ".join(errors))
+
+    return AppConfig(
+        discord_token=discord_token,
+        vip_duration_hours=vip_duration_hours,
+        channel_id=channel_id,
+        timezone=timezone,
+        timezone_name=timezone_name,
+        rcon_host=rcon_host,
+        rcon_port=rcon_port,
+        rcon_password=rcon_password,
+        rcon_version=rcon_version,
+        database_path=database_path,
+        database_table=database_table,
+        moderation_channel_id=moderation_channel_id,
+        moderator_role_id=moderator_role_id,
+        announcement_message_id=announcement_message_id,
+    )
+
+
 class Database:
-    def __init__(self) -> None:
-        self.table = (os.getenv("DATABASE_TABLE") or "vip_players").strip()
-        if not self.table:
-            raise ValueError("DATABASE_TABLE must not be empty.")
+    def __init__(self, path: str, table: str) -> None:
+        self.table = table
         self._identifier = self._quote_identifier(self.table)
+        self._path = path
+        self._ensure_database_directory()
         self._conn = sqlite3.connect(
-            DATABASE_PATH,
+            self._path,
             detect_types=sqlite3.PARSE_DECLTYPES,
             check_same_thread=False,
         )
+        logging.info("Using database file at %s", self._path)
         self._initialise_schema()
 
     def _quote_identifier(self, name: str) -> str:
+        name = name.strip()
+        if not name:
+            raise ValueError("Table name must not be empty.")
         if any(ch in name for ch in ('`', '"', "'", ";")):
             raise ValueError("Invalid characters in table name.")
         return f'"{name}"'
+
+    def _ensure_database_directory(self) -> None:
+        directory = os.path.dirname(os.path.abspath(self._path))
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
 
     def _initialise_schema(self) -> None:
         self._conn.execute(
@@ -71,9 +210,12 @@ class Database:
                 (discord_id, steam_id),
             )
             self._conn.commit()
-        except sqlite3.IntegrityError:
-            # Ignore conflicts on steam_id to mirror previous behaviour.
-            pass
+        except sqlite3.IntegrityError as exc:
+            message = str(exc).lower()
+            if "steam_id" in message:
+                existing_owner = self.fetch_discord_id_for_steam(steam_id)
+                raise DuplicateSteamIDError(steam_id, existing_owner) from exc
+            raise
 
     def fetch_player(self, discord_id: str) -> Optional[str]:
         cursor = self._conn.execute(
@@ -83,9 +225,13 @@ class Database:
         row = cursor.fetchone()
         return row[0] if row else None
 
-
-database = Database()
-bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
+    def fetch_discord_id_for_steam(self, steam_id: str) -> Optional[str]:
+        cursor = self._conn.execute(
+            f"SELECT discord_id FROM {self._identifier} WHERE steam_id = ?",
+            (steam_id,),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
 
 
 class RconError(Exception):
@@ -270,79 +416,139 @@ class RconClient:
             raise RconError(message)
 
 
-def _get_rcon_config() -> Tuple[str, int, str]:
-    if not RCON_HOST or not RCON_PORT or not RCON_PASSWORD:
-        raise RconError("Missing RCON configuration. Ensure RCON_HOST, RCON_PORT, and RCON_PASSWORD are set.")
-    try:
-        port = int(RCON_PORT)
-    except ValueError as exc:
-        raise RconError("RCON_PORT must be an integer.") from exc
-    return RCON_HOST, port, RCON_PASSWORD
+class VipService:
+    def __init__(self, config: AppConfig) -> None:
+        self._config = config
+
+    def grant_vip(self, player_id: str, comment: str) -> str:
+        with RconClient(
+            self._config.rcon_host,
+            self._config.rcon_port,
+            self._config.rcon_password,
+            version=self._config.rcon_version,
+        ) as client:
+            return client.add_vip(player_id, comment)
 
 
-def grant_vip(player_id: str, comment: str) -> str:
-    host, port, password = _get_rcon_config()
-    with RconClient(host, port, password, version=RCON_VERSION) as client:
-        return client.add_vip(player_id, comment)
+class ModeratorNotifier:
+    def __init__(self, config: AppConfig) -> None:
+        self._channel_id = config.moderation_channel_id
+        self._role_id = config.moderator_role_id
 
-@bot.event
-async def on_ready():
-    print(f'Bot is ready: {bot.user}')
-    channel = bot.get_channel(CHANNEL_ID)
-    
-    if channel:
-        view = CombinedView()
-        await channel.send(f"Welcome! Use the buttons below to register your player ID and receive VIP status on all connected servers. You only need to register once, but afterward, you can claim temporary VIP status for {VIP_DURATION_HOURS} hours.", view=view)
-    else:
-        print(f"Error: Channel ID {CHANNEL_ID} not found.")
+    async def notify_duplicate(self, interaction: discord.Interaction, steam_id: str, existing_discord_id: Optional[str]) -> None:
+        if not self._channel_id:
+            logging.info("Duplicate Player-ID detected but MODERATION_CHANNEL_ID is not configured.")
+            return
+
+        channel = interaction.client.get_channel(self._channel_id)
+        if channel is None:
+            try:
+                channel = await interaction.client.fetch_channel(self._channel_id)
+            except discord.DiscordException:
+                logging.exception("Failed to fetch moderation channel with id %s", self._channel_id)
+                return
+
+        role_mention = f"<@&{self._role_id}>" if self._role_id else ""
+        existing_mention = f"<@{existing_discord_id}>" if existing_discord_id else "an unknown user"
+
+        content = (
+            f"{role_mention} Duplicate Player-ID attempt detected.\n"
+            f"Player-ID `{steam_id}` is already associated with {existing_mention}. "
+            f"Attempted by {interaction.user.mention}."
+        ).strip()
+
+        try:
+            await channel.send(content)
+        except discord.DiscordException:
+            logging.exception("Failed to notify moderators about duplicate Player-ID %s", steam_id)
+
 
 class PlayerIDModal(Modal):
-    def __init__(self):
-        super().__init__(title="Please input Player-ID")
-        self.player_id = TextInput(label="Player-ID (Steam-ID or Gamepass-ID)", placeholder="12345678901234567")
+    def __init__(self, database: Database, notifier: ModeratorNotifier):
+        super().__init__(title="Please input Player-ID", custom_id="frontline-pass-player-id-modal")
+        self.database = database
+        self.notifier = notifier
+        self.player_id = TextInput(
+            label="Player-ID (Steam-ID or Gamepass-ID)",
+            placeholder="12345678901234567",
+            custom_id="frontline-pass-player-id-input",
+        )
         self.add_item(self.player_id)
-    
-    async def on_submit(self, interaction: discord.Interaction):
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
         steam_id = self.player_id.value.strip()
-        database.upsert_player(str(interaction.user.id), steam_id)
-        await interaction.response.send_message(f'Your Player-ID {steam_id} has been saved!', ephemeral=True)
+        if not steam_id:
+            await interaction.response.send_message("Player-ID cannot be empty.", ephemeral=True)
+            return
+
+        discord_id = str(interaction.user.id)
+        previous_steam_id = self.database.fetch_player(discord_id)
+
+        try:
+            self.database.upsert_player(discord_id, steam_id)
+        except DuplicateSteamIDError as exc:
+            await interaction.response.send_message(
+                "Error: Player-ID already exists. A moderator has been notified.",
+                ephemeral=True,
+            )
+            await self.notifier.notify_duplicate(interaction, exc.steam_id, exc.existing_discord_id)
+            return
+
+        if previous_steam_id and previous_steam_id != steam_id:
+            message = f"Your Player-ID was updated to {steam_id}."
+        else:
+            message = f"Your Player-ID {steam_id} has been saved!"
+
+        await interaction.response.send_message(message, ephemeral=True)
+
 
 class CombinedView(View):
-    def __init__(self):
+    def __init__(self, config: AppConfig, database: Database, vip_service: VipService, notifier: ModeratorNotifier) -> None:
         super().__init__(timeout=None)
+        self.config = config
+        self.database = database
+        self.vip_service = vip_service
+        self.notifier = notifier
+        self.give_vip_button.label = f"Get VIP ({self.config.vip_duration_label} hours)"
 
-    @discord.ui.button(label="Register", style=ButtonStyle.danger)
-    async def register_button(self, interaction: discord.Interaction, button: Button):
-        modal = PlayerIDModal()
-        await interaction.response.send_modal(modal)
+    @discord.ui.button(label="Register", style=ButtonStyle.danger, custom_id="frontline-pass-register")
+    async def register_button(self, interaction: discord.Interaction, _: Button) -> None:
+        await interaction.response.send_modal(PlayerIDModal(self.database, self.notifier))
 
-    @discord.ui.button(label=f"get VIP ({VIP_DURATION_HOURS} hours)", style=ButtonStyle.green)
-    async def give_vip_button(self, interaction: discord.Interaction, button: Button):
-        steam_id = database.fetch_player(str(interaction.user.id))
+    @discord.ui.button(label="Get VIP", style=ButtonStyle.green, custom_id="frontline-pass-get-vip")
+    async def give_vip_button(self, interaction: discord.Interaction, _: Button) -> None:
+        steam_id = self.database.fetch_player(str(interaction.user.id))
 
         if not steam_id:
-            await interaction.response.send_message("You are not registered! Please use the register button first.", ephemeral=True)
+            await interaction.response.send_message(
+                "You are not registered! Please use the register button first.",
+                ephemeral=True,
+            )
             return
-        local_time = datetime.now(LOCAL_TIMEZONE)
-        expiration_time_local = local_time + timedelta(hours=VIP_DURATION_HOURS)
+
+        local_time = datetime.now(self.config.timezone)
+        expiration_time_local = local_time + timedelta(hours=self.config.vip_duration_hours)
         expiration_time_utc = expiration_time_local.astimezone(pytz.utc)
-        expiration_time_utc_str = expiration_time_utc.strftime('%Y-%m-%d %H:%M:%S')
+        expiration_time_utc_str = expiration_time_utc.strftime("%Y-%m-%d %H:%M:%S")
         comment = f"Discord VIP for {interaction.user.display_name} until {expiration_time_utc_str} UTC"
 
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
         try:
-            loop = asyncio.get_running_loop()
-            status_message = await loop.run_in_executor(None, grant_vip, steam_id, comment)
+            status_message = await asyncio.to_thread(
+                self.vip_service.grant_vip,
+                steam_id,
+                comment,
+            )
         except RconError as exc:
             logging.exception("Failed to grant VIP for player %s", steam_id)
-            await interaction.followup.send(f"Error: VIP status could not be set: {exc}")
+            await interaction.followup.send(f"Error: VIP status could not be set: {exc}", ephemeral=True)
             return
-        except Exception as exc:  # pragma: no cover - defensive catch for unexpected errors
+        except Exception as exc:  # pragma: no cover
             logging.exception("Unexpected error while granting VIP for player %s: %s", steam_id, exc)
-            await interaction.followup.send("An unexpected error occurred while setting VIP status.")
+            await interaction.followup.send("An unexpected error occurred while setting VIP status.", ephemeral=True)
             return
 
-        readable_expiration = expiration_time_local.strftime('%Y-%m-%d %H:%M:%S %Z')
+        readable_expiration = expiration_time_local.strftime("%Y-%m-%d %H:%M:%S %Z")
         logging.info(
             "Granted VIP for player %s until %s UTC (%s)",
             steam_id,
@@ -350,7 +556,88 @@ class CombinedView(View):
             status_message,
         )
         await interaction.followup.send(
-            f"You now have VIP for {VIP_DURATION_HOURS} hours! Expiration: {readable_expiration}"
+            f"You now have VIP for {self.config.vip_duration_label} hours! Expiration: {readable_expiration}",
+            ephemeral=True,
         )
 
-bot.run(DISCORD_TOKEN)
+
+def create_database(config: AppConfig) -> Database:
+    return Database(config.database_path, config.database_table)
+
+
+def create_bot(config: AppConfig, database: Database, vip_service: VipService) -> commands.Bot:
+    intents = discord.Intents.default()
+    bot = commands.Bot(command_prefix="!", intents=intents)
+    notifier = ModeratorNotifier(config)
+    persistent_view = CombinedView(config, database, vip_service, notifier)
+
+    bot.config = config  # type: ignore[attr-defined]
+    bot.database = database  # type: ignore[attr-defined]
+    bot.vip_service = vip_service  # type: ignore[attr-defined]
+    bot.notifier = notifier  # type: ignore[attr-defined]
+    bot.persistent_view = persistent_view  # type: ignore[attr-defined]
+
+    bot.add_view(persistent_view)
+
+    @bot.event
+    async def on_ready() -> None:
+        logging.info("Bot is ready: %s", bot.user)
+        destination = bot.get_channel(config.channel_id)
+        if destination is None:
+            try:
+                destination = await bot.fetch_channel(config.channel_id)
+            except discord.DiscordException:
+                logging.exception("Failed to access channel with id %s", config.channel_id)
+                return
+
+        if not isinstance(destination, (discord.TextChannel, discord.Thread, discord.DMChannel)):
+            logging.error("Channel %s is not a text-based destination.", config.channel_id)
+            return
+
+        message_content = (
+            "Welcome! Use the buttons below to register your player ID and receive VIP status on all connected servers. "
+            f"You only need to register once, but afterward, you can claim temporary VIP status for {config.vip_duration_label} hours."
+        )
+
+        message = None
+        if config.announcement_message_id:
+            try:
+                message = await destination.fetch_message(config.announcement_message_id)
+            except discord.NotFound:
+                logging.warning(
+                    "Configured ANNOUNCEMENT_MESSAGE_ID %s was not found in channel %s.",
+                    config.announcement_message_id,
+                    config.channel_id,
+                )
+            except discord.DiscordException:
+                logging.exception("Failed to fetch configured announcement message %s", config.announcement_message_id)
+
+        if message is None:
+            async for candidate in destination.history(limit=50):
+                if candidate.author == bot.user:
+                    message = candidate
+                    break
+
+        if message:
+            await message.edit(content=message_content, view=persistent_view)
+            logging.info("Reattached control view to existing message %s", message.id)
+        else:
+            sent_message = await destination.send(message_content, view=persistent_view)
+            logging.info(
+                "Posted new announcement message with id %s. Set ANNOUNCEMENT_MESSAGE_ID to reuse it on future restarts.",
+                sent_message.id,
+            )
+
+    return bot
+
+
+def main() -> None:
+    config = load_config()
+    database = create_database(config)
+    vip_service = VipService(config)
+    bot = create_bot(config, database, vip_service)
+    bot.run(config.discord_token)
+
+
+if __name__ == "__main__":
+    main()
