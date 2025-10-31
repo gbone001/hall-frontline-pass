@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 import pytz
+from requests.cookies import RequestsCookieJar
 
 MODULE_PATH = pathlib.Path(__file__).resolve().parent.parent / "frontline-pass.py"
 SPEC = importlib.util.spec_from_file_location("frontline_pass_module", MODULE_PATH)
@@ -25,19 +26,41 @@ Database = frontline_pass.Database
 
 
 class DummyResponse:
-    def __init__(self, status_code: int, payload: dict) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        payload: dict,
+        *,
+        text: str | None = None,
+        cookies: RequestsCookieJar | None = None,
+    ) -> None:
         self.status_code = status_code
         self._payload = payload
-        self.text = "response-text"
+        self.text = text if text is not None else "response-text"
+        self.cookies = cookies or RequestsCookieJar()
 
     def json(self) -> dict:
         return self._payload
 
 
 class DummySession:
-    def __init__(self, response: DummyResponse) -> None:
-        self.response = response
+    def __init__(self, responses) -> None:
+        if isinstance(responses, DummyResponse):
+            responses = [responses]
+        self.responses = list(responses)
         self.calls = []
+        self.verify = True
+        self.cookies = RequestsCookieJar()
+
+    def _next_response(self) -> DummyResponse:
+        if self.responses:
+            response = self.responses.pop(0)
+        else:
+            raise AssertionError("Unexpected HTTP request in DummySession")
+        if response.cookies:
+            for key, value in response.cookies.items():
+                self.cookies.set(key, value)
+        return response
 
     def request(self, method, url, json=None, headers=None, timeout=None):
         self.calls.append(
@@ -49,7 +72,7 @@ class DummySession:
                 "timeout": timeout,
             }
         )
-        return self.response
+        return self._next_response()
 
     def post(self, url, json=None, headers=None, timeout=None):
         return self.request("POST", url, json=json, headers=headers, timeout=timeout)
@@ -107,6 +130,33 @@ class VipHttpClientTests(unittest.TestCase):
 
         self.assertEqual(len(session.calls), 1)
         self.assertNotIn("login", session.calls[0]["url"])
+
+    def test_logs_in_and_uses_session_cookie(self) -> None:
+        cookie_jar = RequestsCookieJar()
+        cookie_jar.set("sessionid", "session-cookie")
+        cookie_jar.set("csrftoken", "csrf-token")
+        login_response = DummyResponse(
+            200,
+            {"result": True, "failed": False},
+            text="login-success",
+            cookies=cookie_jar,
+        )
+        api_response = DummyResponse(200, {"result": "ok"})
+        session = DummySession([login_response, api_response])
+        credentials = HttpCredentials(
+            base_url="https://example",
+            username="user",
+            password="pass",
+        )
+        client = VipHttpClient(credentials, session=session)
+
+        result = client.add_vip("player-id", "desc", None)
+
+        self.assertEqual(result["result"], "ok")
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual(session.calls[0]["url"], "https://example/api/login")
+        self.assertEqual(session.calls[1]["url"], "https://example/api/add_vip")
+        self.assertEqual(session.calls[1]["headers"]["Referer"], "https://example")
 
 
 class VipServiceTests(unittest.TestCase):

@@ -1000,6 +1000,8 @@ class VipHttpClient:
         self.session = session or requests.Session()
         self.session.verify = credentials.verify
         self._token: Optional[str] = None
+        self._authenticated = False
+        self._bearer_failed = False
 
     def _endpoint(self, name: str) -> str:
         base = self.credentials.base_url.rstrip("/")
@@ -1017,19 +1019,26 @@ class VipHttpClient:
             token = self._authorization_token()
             if token:
                 headers["Authorization"] = f"Bearer {token}"
+            else:
+                headers.setdefault("Referer", self.credentials.base_url)
         return headers
 
     def _authorization_token(self) -> Optional[str]:
-        if self.credentials.bearer_token:
+        if self.credentials.bearer_token and not self._bearer_failed:
             return self.credentials.bearer_token
-        if self._has_login_credentials():
-            if not self._token:
-                self._login()
-            return self._token
-        return None
+        return self._token
 
     def _has_login_credentials(self) -> bool:
         return bool(self.credentials.username and self.credentials.password)
+
+    def _ensure_authenticated(self) -> None:
+        if self._authorization_token():
+            return
+        if self._authenticated:
+            return
+        if not self._has_login_credentials():
+            return
+        self._login()
 
     def _login(self) -> None:
         if not self._has_login_credentials():
@@ -1050,15 +1059,19 @@ class VipHttpClient:
             )
 
         data = self._parse_json(response)
-        token = self._extract_token(data)
-        if not isinstance(token, str) or not token:
-            raise VipHTTPError(f"Login response did not include a token. Payload: {data}")
-        self._token = token
+        if data.get("failed"):
+            raise VipHTTPError(f"Login failed: {data.get('error') or data}")
+
+        # Session-based auth relies on cookies (csrftoken/sessionid)
+        if not self.session.cookies.get("sessionid"):
+            raise VipHTTPError("Login succeeded but no session cookie was provided.")
+        self._authenticated = True
 
     def _refresh_token_if_possible(self) -> bool:
         if not self._has_login_credentials():
             return False
         self._token = None
+        self._authenticated = False
         try:
             self._login()
         except VipHTTPError:
@@ -1073,6 +1086,7 @@ class VipHttpClient:
         json_payload: Optional[Dict[str, Any]] = None,
     ) -> requests.Response:
         url = self._endpoint(endpoint)
+        self._ensure_authenticated()
         headers = self._headers()
         response = self.session.request(
             method,
@@ -1081,19 +1095,24 @@ class VipHttpClient:
             json=json_payload,
             timeout=self.timeout,
         )
-        if (
-            response.status_code == 401
-            and not self.credentials.bearer_token
-            and self._refresh_token_if_possible()
-        ):
-            headers = self._headers()
-            response = self.session.request(
+        if response.status_code == 401:
+            if self.credentials.bearer_token:
+                self._bearer_failed = True
+            logging.warning(
+                "HTTP %s %s returned 401: %s",
                 method,
-                url,
-                headers=headers,
-                json=json_payload,
-                timeout=self.timeout,
+                endpoint,
+                response.text,
             )
+            if self._refresh_token_if_possible():
+                headers = self._headers()
+                response = self.session.request(
+                    method,
+                    url,
+                    headers=headers,
+                    json=json_payload,
+                    timeout=self.timeout,
+                )
         return response
 
     @staticmethod
