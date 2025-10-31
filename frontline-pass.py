@@ -7,9 +7,9 @@ import json
 import logging
 import os
 import socket
-import sqlite3
 import struct
 import requests
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO)
 
-ANNOUNCEMENT_TITLE = "Frontline VIP Control Center"
+ANNOUNCEMENT_TITLE = "VIP Control Center"
 ANNOUNCEMENT_METADATA_KEY = "announcement_message_id"
 LAST_GRANT_METADATA_KEY = "last_vip_grant"
 
@@ -205,9 +205,9 @@ def _resolve_database_path(explicit_path: Optional[str]) -> str:
 
     for base_dir in fallback_dirs:
         if base_dir:
-            return os.path.join(base_dir, "frontline-pass.db")
+            return os.path.join(base_dir, "vip-data.json")
 
-    return "frontline-pass.db"
+    return "vip-data.json"
 
 
 def _optional_int(name: str) -> Optional[int]:
@@ -377,116 +377,102 @@ def load_config() -> AppConfig:
 class Database:
     def __init__(self, path: str, table: str) -> None:
         self.table = table
-        self._identifier = self._quote_identifier(self.table)
         self._path = path
+        self._lock = threading.Lock()
+        self._data: Dict[str, Any] = {"players": {}, "metadata": {}}
         self._ensure_database_directory()
-        self._conn = sqlite3.connect(
-            self._path,
-            detect_types=sqlite3.PARSE_DECLTYPES,
-            check_same_thread=False,
-        )
-        logging.info("Using database file at %s", self._path)
-        self._initialise_schema()
-
-    def _quote_identifier(self, name: str) -> str:
-        name = name.strip()
-        if not name:
-            raise ValueError("Table name must not be empty.")
-        if any(ch in name for ch in ('`', '"', "'", ";")):
-            raise ValueError("Invalid characters in table name.")
-        return f'"{name}"'
+        self._load()
+        self._save()  # ensure a file exists on disk
+        logging.info("Using JSON database file at %s", self._path)
 
     def _ensure_database_directory(self) -> None:
         directory = os.path.dirname(os.path.abspath(self._path))
         if directory and not os.path.exists(directory):
             os.makedirs(directory, exist_ok=True)
 
-    def _initialise_schema(self) -> None:
-        self._conn.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self._identifier} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                discord_id TEXT UNIQUE NOT NULL,
-                steam_id TEXT UNIQUE NOT NULL
-            )
-            """
-        )
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS vip_metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
-        self._conn.commit()
+    def _load(self) -> None:
+        data: Dict[str, Any] = {}
+        try:
+            with open(self._path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            data = {}
+        except Exception:
+            logging.exception("Failed to load JSON database from %s; starting with empty data.", self._path)
+            data = {}
+
+        if not isinstance(data, dict):
+            data = {}
+
+        players: Dict[str, str] = {}
+        for discord_id, record in data.get("players", {}).items():
+            steam_id: Optional[str]
+            if isinstance(record, dict):
+                steam_id = record.get("steam_id")
+            else:
+                steam_id = record
+            if isinstance(discord_id, str) and isinstance(steam_id, str) and steam_id:
+                players[discord_id] = steam_id
+
+        metadata: Dict[str, str] = {}
+        for key, value in data.get("metadata", {}).items():
+            if isinstance(key, str) and isinstance(value, str):
+                metadata[key] = value
+
+        with self._lock:
+            self._data = {"players": players, "metadata": metadata}
+
+    def _save_locked(self) -> None:
+        tmp_path = f"{self._path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(self._data, handle, indent=2, sort_keys=True)
+        os.replace(tmp_path, self._path)
+
+    def _save(self) -> None:
+        with self._lock:
+            self._save_locked()
+
+    def _players(self) -> Dict[str, str]:
+        return self._data.setdefault("players", {})
 
     def upsert_player(self, discord_id: str, steam_id: str) -> None:
-        try:
-            self._conn.execute(
-                f"""
-                INSERT INTO {self._identifier} (discord_id, steam_id)
-                VALUES (?, ?)
-                ON CONFLICT(discord_id) DO UPDATE SET steam_id=excluded.steam_id
-                """,
-                (discord_id, steam_id),
-            )
-            self._conn.commit()
-        except sqlite3.IntegrityError as exc:
-            message = str(exc).lower()
-            if "steam_id" in message:
-                existing_owner = self.fetch_discord_id_for_steam(steam_id)
-                raise DuplicateSteamIDError(steam_id, existing_owner) from exc
-            raise
+        with self._lock:
+            players = self._players()
+            for existing_discord_id, existing_steam in players.items():
+                if existing_steam == steam_id and existing_discord_id != discord_id:
+                    raise DuplicateSteamIDError(steam_id, existing_discord_id)
+            players[discord_id] = steam_id
+            self._save_locked()
 
     def fetch_player(self, discord_id: str) -> Optional[str]:
-        cursor = self._conn.execute(
-            f"SELECT steam_id FROM {self._identifier} WHERE discord_id = ?",
-            (discord_id,),
-        )
-        row = cursor.fetchone()
-        return row[0] if row else None
+        with self._lock:
+            return self._players().get(discord_id)
 
     def fetch_discord_id_for_steam(self, steam_id: str) -> Optional[str]:
-        cursor = self._conn.execute(
-            f"SELECT discord_id FROM {self._identifier} WHERE steam_id = ?",
-            (steam_id,),
-        )
-        row = cursor.fetchone()
-        return row[0] if row else None
+        with self._lock:
+            for discord_id, stored_steam in self._players().items():
+                if stored_steam == steam_id:
+                    return discord_id
+        return None
 
     def set_metadata(self, key: str, value: str) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO vip_metadata (key, value)
-            VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value
-            """,
-            (key, value),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._data.setdefault("metadata", {})[key] = value
+            self._save_locked()
 
     def get_metadata(self, key: str) -> Optional[str]:
-        cursor = self._conn.execute(
-            "SELECT value FROM vip_metadata WHERE key = ?",
-            (key,),
-        )
-        row = cursor.fetchone()
-        return row[0] if row else None
+        with self._lock:
+            return self._data.get("metadata", {}).get(key)
 
     def delete_metadata(self, key: str) -> None:
-        self._conn.execute(
-            "DELETE FROM vip_metadata WHERE key = ?",
-            (key,),
-        )
-        self._conn.commit()
+        with self._lock:
+            metadata = self._data.setdefault("metadata", {})
+            metadata.pop(key, None)
+            self._save_locked()
 
     def count_players(self) -> int:
-        cursor = self._conn.execute(
-            f"SELECT COUNT(*) FROM {self._identifier}"
-        )
-        row = cursor.fetchone()
-        return int(row[0] if row else 0)
+        with self._lock:
+            return len(self._players())
 
 
 class RconError(Exception):
@@ -910,7 +896,7 @@ class PlayerIDModal(Modal):
         self.database = database
         self.notifier = notifier
         self.player_id = TextInput(
-            label="Player-ID (Steam-ID or Gamepass-ID)",
+            label="T17 / Steam ID",
             placeholder="12345678901234567",
             custom_id="frontline-pass-player-id-input",
         )
@@ -919,7 +905,7 @@ class PlayerIDModal(Modal):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         steam_id = self.player_id.value.strip()
         if not steam_id:
-            await interaction.response.send_message("Player-ID cannot be empty.", ephemeral=True)
+            await interaction.response.send_message("T17 ID cannot be empty.", ephemeral=True)
             schedule_ephemeral_cleanup(interaction)
             return
 
@@ -930,7 +916,7 @@ class PlayerIDModal(Modal):
             self.database.upsert_player(discord_id, steam_id)
         except DuplicateSteamIDError as exc:
             await interaction.response.send_message(
-                "Error: Player-ID already exists. A moderator has been notified.",
+                "Error: That T17 ID is already linked to another Discord account. A moderator has been notified.",
                 ephemeral=True,
             )
             schedule_ephemeral_cleanup(interaction)
@@ -938,9 +924,9 @@ class PlayerIDModal(Modal):
             return
 
         if previous_steam_id and previous_steam_id != steam_id:
-            message = f"Your Player-ID was updated to {steam_id}."
+            message = f"Your T17 ID was updated to {steam_id}."
         else:
-            message = f"Your Player-ID {steam_id} has been saved!"
+            message = f"Your T17 ID {steam_id} has been saved!"
 
         await interaction.response.send_message(message, ephemeral=True)
         schedule_ephemeral_cleanup(interaction)
@@ -962,6 +948,15 @@ class CombinedView(PersistentView):
 
     @discord.ui.button(label="Register", style=ButtonStyle.danger, custom_id="frontline-pass-register")
     async def register_button(self, interaction: discord.Interaction, _: Button) -> None:
+        existing = self.database.fetch_player(str(interaction.user.id))
+        if existing:
+            await interaction.response.send_message(
+                "You're already registered. Your T17 and Discord IDs are linked.",
+                ephemeral=True,
+            )
+            schedule_ephemeral_cleanup(interaction)
+            return
+
         await interaction.response.send_modal(PlayerIDModal(self.database, self.notifier))
 
     @discord.ui.button(label="Get VIP", style=ButtonStyle.green, custom_id="frontline-pass-get-vip")
@@ -970,7 +965,7 @@ class CombinedView(PersistentView):
 
         if not steam_id:
             await interaction.response.send_message(
-                "You are not registered! Please use the register button first.",
+                "You are not linked to a T17 account. Please register first.",
                 ephemeral=True,
             )
             schedule_ephemeral_cleanup(interaction)

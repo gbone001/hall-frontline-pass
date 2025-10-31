@@ -1,55 +1,54 @@
-# Discord VIP Bot
+# Frontline Pass
 
-Frontline Pass is a Discord bot that lets players self-serve temporary VIP access on Hell Let Loose servers. Users register their Player-ID once, then press a button whenever they need VIP status. The bot writes Player-IDs to SQLite, talks to the HLL RCON interface (and optionally the CRCON HTTP API), and keeps a persistent Discord message online with live stats.
+Frontline Pass is a Discord bot that lets Hell Let Loose players link their Discord account to a T17/Steam ID and self-grant temporary VIP status. Player links live in a lightweight JSON file, the bot prefers the CRCON HTTP API when available, and it always falls back to the in-game RCON `AddVip` command.
 
-## Features
+## Highlights
 
-- **Self-service registration** with a Discord modal for Steam- or Gamepass Player-IDs.
-- **One-click VIP provisioning** that first tries the CRCON HTTP API (if configured) and falls back to the in-game RCON `AddVip` command.
-- **Persistent controls**: the control panel survives bot restarts, auto-refreshes after each VIP grant, and exposes an `/repost_frontline_controls` slash command for administrators.
-- **Duplicate protection** that blocks reused Player-IDs and (optionally) pings moderators in a dedicated channel.
-- **Localized expiries**: expiration timestamps are shown in the timezone of your choice.
+- **Self-service VIPs** - players register once and press **Get VIP** whenever they need a slot.
+- **Smart transport** - CRCON HTTP (with automatic login/token refresh) first, RCON fallback second.
+- **Always-on control panel** - the Discord message survives restarts and can be reposted via `/repost_frontline_controls`.
+- **Duplicate protection** - blocks reused T17 IDs and can ping a moderator channel/role.
+- **Timezone-aware** - expiry timestamps are rendered in your configured locale.
 
-## Quick Start
+## Install & Run
 
-1. **Clone and install**
-   ```bash
-   git clone https://github.com/yourusername/your-repository.git
-   cd your-repository
-   pip install -r requirements.txt
-   ```
-2. **Create configuration**
-   ```bash
-   copy .env.dist .env  # Windows
-   # or
-   cp .env.dist .env    # macOS / Linux
-   ```
-   Fill in the required environment variables (see [Configuration](#configuration)).
-3. **Run the bot**
-   ```bash
-   python frontline-pass.py
-   ```
+```bash
+git clone https://github.com/yourusername/hall-frontline-pass.git
+cd hall-frontline-pass
+pip install -r requirements.txt
 
-The persistent control embed will appear in the configured channel the first time the bot connects.
+copy .env.dist .env   # Windows
+# or
+cp .env.dist .env     # macOS / Linux
+```
 
-## Configuration
+Configure `.env`, then start the bot:
 
-| Variable | Required | Description |
+```bash
+python frontline-pass.py
+```
+
+On first launch the bot posts the control panel in your target channel and creates `vip-data.json` (or the path specified by `DATABASE_PATH`).
+
+## Configuration Cheat Sheet
+
+| Variable | Required | Purpose |
 | --- | --- | --- |
-| `DISCORD_TOKEN` | ✅ | Discord bot token. |
-| `VIP_DURATION_HOURS` | ✅ | Number of hours a VIP grant should last. |
-| `CHANNEL_ID` | ✅ | Channel where the persistent control embed should live. |
-| `LOCAL_TIMEZONE` | ✅ | IANA timezone (e.g. `Europe/Berlin`) for user-facing timestamps. |
-| `RCON_HOST`, `RCON_PORT`, `RCON_PASSWORD` | ✅ | Hell Let Loose RCON connection details. |
+| `DISCORD_TOKEN` | Yes | Discord bot token. |
+| `VIP_DURATION_HOURS` | Yes | Duration of each VIP grant. |
+| `CHANNEL_ID` | Yes | Channel hosting the control panel buttons. |
+| `LOCAL_TIMEZONE` | Yes | Timezone for human-readable expiry timestamps (e.g. `Australia/Sydney`). |
+| `RCON_HOST`, `RCON_PORT`, `RCON_PASSWORD` | Yes | Hell Let Loose RCON V2 connection details. |
 | `RCON_VERSION` | Optional | RCON protocol version (default `2`). |
-| `DATABASE_PATH` | Optional | SQLite path. Leave blank to auto-select a file (supports Railway volumes). |
-| `DATABASE_TABLE` | Optional | Table name for VIP records (default `vip_players`). |
-| `ANNOUNCEMENT_MESSAGE_ID` | Optional | Existing Discord message ID to reuse for the control panel. |
-| `MODERATION_CHANNEL_ID` | Optional | Channel ID to notify when a duplicate Player-ID is detected. |
-| `MODERATOR_ROLE_ID` | Optional | Role to mention in duplicate notifications. |
-| `CRCON_HTTP_BASE_URL`, `CRCON_HTTP_BEARER_TOKEN`, `CRCON_HTTP_USERNAME`, `CRCON_HTTP_PASSWORD` | Optional | Enable the CRCON HTTP API `add_vip` endpoint before falling back to RCON. Provide the CRCON base URL (e.g. `https://123.123.123.123:8010`; the `/api` segment is appended automatically) and either a bearer token or a username/password that has the necessary API permissions (the bot logs in and refreshes tokens automatically). |
+| `DATABASE_PATH` | Optional | JSON file storing Discord <-> T17 links. Leave blank to use `vip-data.json` beside the script (works with Railway volumes). |
+| `DATABASE_TABLE` | Optional | Legacy option kept for backwards compatibility; ignored by the JSON backend. |
+| `ANNOUNCEMENT_MESSAGE_ID` | Optional | Reuse an existing Discord message for the control panel. |
+| `MODERATION_CHANNEL_ID`, `MODERATOR_ROLE_ID` | Optional | Where (and who) to ping when duplicate T17 IDs are detected. |
+| `CRCON_HTTP_BASE_URL` | Optional | CRCON host (no `/api` suffix needed; the bot appends it). |
+| `CRCON_HTTP_BEARER_TOKEN` | Optional | Pre-generated CRCON token. |
+| `CRCON_HTTP_USERNAME`, `CRCON_HTTP_PASSWORD` | Optional | CRCON login credentials. Supply these instead of a bearer token if you want automatic logins and token refreshes. |
 
-The bot validates all required settings at startup and exits with a descriptive error message if something is missing or malformed.
+The bot validates required settings on startup and exits with a clear error when something is missing or malformed.
 
 ### Sample `.env`
 
@@ -57,65 +56,50 @@ The bot validates all required settings at startup and exits with a descriptive 
 DISCORD_TOKEN=your-discord-bot-token
 VIP_DURATION_HOURS=24
 CHANNEL_ID=123456789012345678
-LOCAL_TIMEZONE=Europe/Berlin
+LOCAL_TIMEZONE=Australia/Sydney
 
-# Storage
-DATABASE_PATH=
-DATABASE_TABLE=vip_players
+# Storage (JSON)
+DATABASE_PATH=/data/vip-data.json
+DATABASE_TABLE=vip_players   # ignored, kept for compatibility
 
-# Announcement controls
+# Moderator notifications (optional)
 ANNOUNCEMENT_MESSAGE_ID=
-
-# Moderator notifications
 MODERATION_CHANNEL_ID=
 MODERATOR_ROLE_ID=
 
-# Optional CRCON HTTP API (host only; /api is appended automatically)
+# CRCON HTTP API (optional - /api is appended automatically)
 CRCON_HTTP_BASE_URL=https://crcon.example.com:8010
-CRCON_HTTP_BEARER_TOKEN=      # Leave empty when using username/password login
-CRCON_HTTP_USERNAME=
-CRCON_HTTP_PASSWORD=
+CRCON_HTTP_BEARER_TOKEN=
+CRCON_HTTP_USERNAME=vipbot
+CRCON_HTTP_PASSWORD=supersecret
 
 # RCON
-RCON_HOST=127.0.0.1
+RCON_HOST=203.0.113.10
 RCON_PORT=21115
 RCON_PASSWORD=your-rcon-password
 RCON_VERSION=2
 ```
 
-## Usage
+## Bot Experience
 
-1. **Register** – users click the **Register** button and provide their Player-ID. The bot stores the value in SQLite.
-2. **Request VIP** – pressing **Get VIP** grants temporary VIP access. The status message includes whether the HTTP API or RCON path succeeded.
-3. **Monitor** – the persistent embed shows the total number of registered players and the timestamp of the last VIP grant.
-4. **Admin tools** – run `/repost_frontline_controls` to delete and recreate the embed (e.g. after pruning messages). The bot also refreshes the embed automatically after every successful VIP grant.
+1. **Register** - clicking **Register** prompts the user for their T17/Steam ID. The bot stores the mapping in JSON, prevents duplicates, and acknowledges success.
+2. **Get VIP** - clicking **Get VIP** looks up the user's Discord ID. If a T17 ID is linked, the bot grants VIP via CRCON/RCON and reports the expiry. If not, it reminds the user to register first.
 
-## Deployment on Railway
+Admins can refresh the message at any time with `/repost_frontline_controls`.
 
-This repository ships with a `Procfile` and `railway.toml` suited for Railway’s Nixpacks builder.
+## Deployment Notes
 
-1. Install the [Railway CLI](https://docs.railway.app/develop/cli) and authenticate with `railway login`, or connect the repository from the dashboard.
-2. Provision a new service backed by this repo. Railway auto-installs dependencies from `requirements.txt`.
-3. Set environment variables:
-   ```bash
-   railway variables set DISCORD_TOKEN=... VIP_DURATION_HOURS=4 CHANNEL_ID=... \
-     LOCAL_TIMEZONE=Europe/Berlin RCON_HOST=... RCON_PORT=21115 RCON_PASSWORD=...
-   ```
-   Add optional variables (`RCON_VERSION`, `DATABASE_TABLE`, `DATABASE_PATH`, `ANNOUNCEMENT_MESSAGE_ID`, `MODERATION_CHANNEL_ID`, `MODERATOR_ROLE_ID`, `CRCON_HTTP_*`) as needed.
-4. (Recommended) Attach a persistent volume:
-   ```bash
-   railway volume create frontline-pass-data --mountPath /data
-   ```
-   When mounted, the bot automatically stores `frontline-pass.db` inside the provided path.
-5. Deploy with `railway up` or trigger a deploy from the dashboard. Follow logs with `railway logs`.
+- **Local / bare metal** - run `python frontline-pass.py` under your favorite supervisor (systemd, pm2, tmux). Ensure the working directory is writable so the JSON file can be updated.
+- **Railway** - the repo ships with `Procfile` and `railway.toml`. Attach a volume (e.g. `/data`) and set `DATABASE_PATH=/data/vip-data.json` to persist player links between deploys. Configure environment variables through the Railway dashboard or CLI.
 
-## Dependencies
+## Requirements
 
+- Python 3.8+
 - `discord.py`
 - `pytz`
 - `python-dotenv`
-- `requests` (only needed when using the CRCON HTTP API integration)
+- `requests` (needed only when CRCON HTTP is enabled)
 
 ## License
 
-Frontline Pass is released under the MIT License. See [LICENSE](LICENSE).
+Frontline Pass is released under the MIT License. See [LICENSE](LICENSE) for details.
