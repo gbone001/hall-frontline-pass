@@ -47,7 +47,7 @@ The persistent control embed will appear in the configured channel the first tim
 | `ANNOUNCEMENT_MESSAGE_ID` | Optional | Existing Discord message ID to reuse for the control panel. |
 | `MODERATION_CHANNEL_ID` | Optional | Channel ID to notify when a duplicate Player-ID is detected. |
 | `MODERATOR_ROLE_ID` | Optional | Role to mention in duplicate notifications. |
-| `CRCON_HTTP_BASE_URL`, `CRCON_HTTP_BEARER_TOKEN` | Optional | Enable the CRCON HTTP API `add_vip` endpoint before falling back to RCON. Provide the API base (e.g. `https://123.123.123.123:8010/api/`) and the CRCON bearer token (as used by [sctewa1/hll-discord-ping](https://github.com/sctewa1/hll-discord-ping)). |
+| `CRCON_HTTP_BASE_URL`, `CRCON_HTTP_BEARER_TOKEN`, `CRCON_HTTP_USERNAME`, `CRCON_HTTP_PASSWORD` | Optional | Enable the CRCON HTTP API `add_vip` endpoint before falling back to RCON. Provide the CRCON base URL (e.g. `https://123.123.123.123:8010`; the `/api` segment is appended automatically) and either a bearer token or a username/password that has the necessary API permissions (the bot logs in and refreshes tokens automatically). |
 
 The bot validates all required settings at startup and exits with a descriptive error message if something is missing or malformed.
 
@@ -70,9 +70,11 @@ ANNOUNCEMENT_MESSAGE_ID=
 MODERATION_CHANNEL_ID=
 MODERATOR_ROLE_ID=
 
-# Optional CRCON HTTP API
-CRCON_HTTP_BASE_URL=
-CRCON_HTTP_BEARER_TOKEN=
+# Optional CRCON HTTP API (host only; /api is appended automatically)
+CRCON_HTTP_BASE_URL=https://crcon.example.com:8010
+CRCON_HTTP_BEARER_TOKEN=      # Leave empty when using username/password login
+CRCON_HTTP_USERNAME=
+CRCON_HTTP_PASSWORD=
 
 # RCON
 RCON_HOST=127.0.0.1

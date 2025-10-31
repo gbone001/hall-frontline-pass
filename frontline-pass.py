@@ -223,7 +223,9 @@ def _optional_int(name: str) -> Optional[int]:
 @dataclass(frozen=True)
 class HttpCredentials:
     base_url: str
-    bearer_token: str
+    bearer_token: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -313,21 +315,41 @@ def load_config() -> AppConfig:
 
     http_base_url = os.getenv("CRCON_HTTP_BASE_URL")
     http_bearer_token = os.getenv("CRCON_HTTP_BEARER_TOKEN")
+    http_username = os.getenv("CRCON_HTTP_USERNAME")
+    http_password = os.getenv("CRCON_HTTP_PASSWORD")
     http_credentials: Optional[HttpCredentials] = None
 
-    provided_http_values = [http_base_url, http_bearer_token]
-    if any(provided_http_values):
+    trimmed_base = (http_base_url or "").strip()
+    trimmed_token = (http_bearer_token or "").strip()
+    trimmed_username = (http_username or "").strip()
+    password_provided = bool(http_password and http_password.strip())
+
+    if any(
+        value
+        for value in (
+            trimmed_base,
+            trimmed_token,
+            trimmed_username,
+            http_password if http_password else None,
+        )
+    ):
         trimmed_base = (http_base_url or "").strip()
         if not trimmed_base:
             errors.append("CRCON_HTTP_BASE_URL is required when using the HTTP API integration")
-        trimmed_token = (http_bearer_token or "").strip()
-        if not trimmed_token:
-            errors.append("CRCON_HTTP_BEARER_TOKEN is required when using the HTTP API integration")
+        if not trimmed_token and not (trimmed_username and password_provided):
+            errors.append(
+                "Provide either CRCON_HTTP_BEARER_TOKEN or both CRCON_HTTP_USERNAME and CRCON_HTTP_PASSWORD "
+                "when enabling the HTTP API integration"
+            )
+        if trimmed_username and not password_provided:
+            errors.append("CRCON_HTTP_PASSWORD is required when CRCON_HTTP_USERNAME is provided")
 
-        if trimmed_base and trimmed_token:
+        if trimmed_base and (trimmed_token or (trimmed_username and password_provided)):
             http_credentials = HttpCredentials(
                 base_url=trimmed_base.rstrip("/"),
-                bearer_token=trimmed_token,
+                bearer_token=trimmed_token or None,
+                username=trimmed_username or None,
+                password=http_password if password_provided else None,
             )
 
     if errors:
@@ -543,7 +565,7 @@ class RconClient:
         self._auth_token = token
 
     def add_vip(self, player_id: str, comment: str = "") -> str:
-        response = self.execute("AddVip", {"PlayerId": player_id, "Comment": comment})
+        response = self.execute("AddVip", {"PlayerId": player_id, "Description": comment})
         return self._get_status_message(response) or "VIP added successfully."
 
     def execute(self, command: str, content_body: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -745,16 +767,97 @@ class VipHttpClient:
         self.credentials = credentials
         self.timeout = timeout
         self.session = session or requests.Session()
+        self._token: Optional[str] = None
 
     def _endpoint(self, name: str) -> str:
-        return f"{self.credentials.base_url}/{name.lstrip('/')}"
+        base = self.credentials.base_url.rstrip("/")
+        if not base.lower().endswith("/api"):
+            base = f"{base}/api"
+        return f"{base}/{name.lstrip('/')}"
 
-    def _headers(self) -> Dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.credentials.bearer_token}",
+    def _headers(self, *, include_auth: bool = True) -> Dict[str, str]:
+        headers: Dict[str, str] = {
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
+        if include_auth:
+            token = self._authorization_token()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    def _authorization_token(self) -> Optional[str]:
+        if not self.credentials:
+            return None
+        if self.credentials.bearer_token:
+            return self.credentials.bearer_token
+        if self._has_login_credentials():
+            if not self._token:
+                self._login()
+            return self._token
+        return None
+
+    def _has_login_credentials(self) -> bool:
+        return bool(self.credentials.username and self.credentials.password)
+
+    def _login(self) -> None:
+        if not self._has_login_credentials():
+            raise VipHTTPError("CRCON HTTP username/password are not configured.")
+
+        response = self.session.post(
+            self._endpoint("login"),
+            json={
+                "username": self.credentials.username,
+                "password": self.credentials.password,
+            },
+            headers=self._headers(include_auth=False),
+            timeout=self.timeout,
+        )
+        if response.status_code != 200:
+            raise VipHTTPError(f"Login failed with status {response.status_code}: {response.text}")
+
+        data = self._parse_json(response)
+        token = data.get("result") or data.get("token") or data.get("access_token")
+        if not isinstance(token, str) or not token:
+            raise VipHTTPError("Login response did not include a token.")
+        self._token = token
+
+    def _refresh_token_if_possible(self) -> bool:
+        if not self._has_login_credentials():
+            return False
+        self._token = None
+        try:
+            self._authorization_token()
+        except VipHTTPError:
+            return False
+        return True
+
+    def _request_with_reauth(
+        self,
+        method: str,
+        endpoint: str,
+        *,
+        json_payload: Optional[Dict[str, Any]] = None,
+    ) -> requests.Response:
+        url = self._endpoint(endpoint)
+        headers = self._headers()
+        response = self.session.request(
+            method,
+            url,
+            headers=headers,
+            json=json_payload,
+            timeout=self.timeout,
+        )
+        if response.status_code == 401 and self._refresh_token_if_possible():
+            headers = self._headers()
+            response = self.session.request(
+                method,
+                url,
+                headers=headers,
+                json=json_payload,
+                timeout=self.timeout,
+            )
+        return response
 
     def add_vip(
         self,
@@ -770,12 +873,7 @@ class VipHttpClient:
             payload["expiration"] = expiration_iso
 
         try:
-            response = self.session.post(
-                self._endpoint("add_vip"),
-                json=payload,
-                headers=self._headers(),
-                timeout=self.timeout,
-            )
+            response = self._request_with_reauth("POST", "add_vip", json_payload=payload)
         except requests.exceptions.RequestException as exc:
             raise VipHTTPError(f"HTTP API request failed: {exc}") from exc
 
