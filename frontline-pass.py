@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import discord
 import pytz
-from discord import ButtonStyle
+from discord import ButtonStyle, app_commands
 try:
     from discord.abc import MessageableChannel
 except ImportError:  # discord.py>=2.4 renamed MessageableChannel -> Messageable
@@ -30,6 +30,7 @@ logging.basicConfig(level=logging.INFO)
 ANNOUNCEMENT_TITLE = "VIP Control Center"
 ANNOUNCEMENT_METADATA_KEY = "announcement_message_id"
 LAST_GRANT_METADATA_KEY = "last_vip_grant"
+VIP_DURATION_METADATA_KEY = "vip_duration_hours"
 
 
 def schedule_ephemeral_cleanup(
@@ -56,7 +57,7 @@ class DuplicateSteamIDError(Exception):
         self.existing_discord_id = existing_discord_id
 
 
-def build_announcement_embed(config: AppConfig, database: "Database") -> discord.Embed:
+def build_announcement_embed(config: AppConfig, database: "Database", vip_duration_hours: float) -> discord.Embed:
     total_players = database.count_players()
     last_grant_text = "No VIP grants yet."
     last_grant_value = database.get_metadata(LAST_GRANT_METADATA_KEY)
@@ -74,7 +75,7 @@ def build_announcement_embed(config: AppConfig, database: "Database") -> discord
         title=ANNOUNCEMENT_TITLE,
         description=(
             "Use the buttons below to register your Player-ID and request VIP access.\n"
-            f"VIP duration: **{config.vip_duration_label} hours**.\n"
+            f"VIP duration: **{vip_duration_hours:g} hours**.\n"
             "Registration is required once; future VIP requests are instant."
         ),
         color=0x2F3136,
@@ -96,6 +97,7 @@ class AnnouncementManager:
         self,
         bot: commands.Bot,
         view: View,
+        vip_duration_hours: float,
         *,
         force_new: bool = False,
     ) -> Optional[discord.Message]:
@@ -103,7 +105,7 @@ class AnnouncementManager:
         if destination is None:
             return None
 
-        embed = build_announcement_embed(self._config, self._database)
+        embed = build_announcement_embed(self._config, self._database, vip_duration_hours)
         message = await self._locate_message(destination, bot, force_new=force_new)
 
         if message and not force_new:
@@ -220,12 +222,28 @@ def _optional_int(name: str) -> Optional[int]:
         raise RuntimeError(f"Invalid integer for {name}: {value}") from exc
 
 
+def _parse_bool_env(name: str, raw: Optional[str], errors: List[str]) -> Optional[bool]:
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if not value:
+        return None
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    errors.append(f"{name} must be a boolean (true/false); got {raw!r}")
+    return None
+
+
 @dataclass(frozen=True)
 class HttpCredentials:
     base_url: str
     bearer_token: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
+    verify: bool = True
+    timeout: float = 20.0
 
 
 @dataclass(frozen=True)
@@ -317,12 +335,29 @@ def load_config() -> AppConfig:
     http_bearer_token = os.getenv("CRCON_HTTP_BEARER_TOKEN")
     http_username = os.getenv("CRCON_HTTP_USERNAME")
     http_password = os.getenv("CRCON_HTTP_PASSWORD")
+    http_verify_raw = os.getenv("CRCON_HTTP_VERIFY", "true")
+    http_timeout_raw = os.getenv("CRCON_HTTP_TIMEOUT", "20")
     http_credentials: Optional[HttpCredentials] = None
 
     trimmed_base = (http_base_url or "").strip()
     trimmed_token = (http_bearer_token or "").strip()
     trimmed_username = (http_username or "").strip()
     password_provided = bool(http_password and http_password.strip())
+    http_verify = True
+    parsed_verify = _parse_bool_env("CRCON_HTTP_VERIFY", http_verify_raw, errors)
+    if parsed_verify is not None:
+        http_verify = parsed_verify
+
+    http_timeout = 20.0
+    if http_timeout_raw is not None:
+        timeout_value = http_timeout_raw.strip()
+        if timeout_value:
+            try:
+                http_timeout = float(timeout_value)
+                if http_timeout <= 0:
+                    errors.append("CRCON_HTTP_TIMEOUT must be greater than zero")
+            except ValueError:
+                errors.append(f"CRCON_HTTP_TIMEOUT must be a number (got {http_timeout_raw!r})")
 
     if any(
         value
@@ -333,9 +368,16 @@ def load_config() -> AppConfig:
             http_password if http_password else None,
         )
     ):
-        trimmed_base = (http_base_url or "").strip()
-        if not trimmed_base:
+        normalized_base = trimmed_base.rstrip("/")
+        if not normalized_base:
             errors.append("CRCON_HTTP_BASE_URL is required when using the HTTP API integration")
+        else:
+            lowered_base = normalized_base.lower()
+            if lowered_base.endswith("/api") or "/api/" in lowered_base:
+                errors.append(
+                    "CRCON_HTTP_BASE_URL should not include '/api'. Provide the host only "
+                    "(e.g. https://example.com:8010)."
+                )
         if not trimmed_token and not (trimmed_username and password_provided):
             errors.append(
                 "Provide either CRCON_HTTP_BEARER_TOKEN or both CRCON_HTTP_USERNAME and CRCON_HTTP_PASSWORD "
@@ -344,12 +386,14 @@ def load_config() -> AppConfig:
         if trimmed_username and not password_provided:
             errors.append("CRCON_HTTP_PASSWORD is required when CRCON_HTTP_USERNAME is provided")
 
-        if trimmed_base and (trimmed_token or (trimmed_username and password_provided)):
+        if normalized_base and (trimmed_token or (trimmed_username and password_provided)):
             http_credentials = HttpCredentials(
-                base_url=trimmed_base.rstrip("/"),
+                base_url=normalized_base,
                 bearer_token=trimmed_token or None,
                 username=trimmed_username or None,
                 password=http_password if password_provided else None,
+                verify=http_verify,
+                timeout=http_timeout,
             )
 
     if errors:
@@ -751,8 +795,9 @@ class VipHttpClient:
         session: Optional[requests.Session] = None,
     ) -> None:
         self.credentials = credentials
-        self.timeout = timeout
+        self.timeout = credentials.timeout or timeout
         self.session = session or requests.Session()
+        self.session.verify = credentials.verify
         self._token: Optional[str] = None
 
     def _endpoint(self, name: str) -> str:
@@ -773,14 +818,12 @@ class VipHttpClient:
         return headers
 
     def _authorization_token(self) -> Optional[str]:
-        if not self.credentials:
-            return None
-        if self.credentials.bearer_token:
-            return self.credentials.bearer_token
         if self._has_login_credentials():
             if not self._token:
                 self._login()
             return self._token
+        if self.credentials.bearer_token:
+            return self.credentials.bearer_token
         return None
 
     def _has_login_credentials(self) -> bool:
@@ -803,7 +846,7 @@ class VipHttpClient:
             raise VipHTTPError(f"Login failed with status {response.status_code}: {response.text}")
 
         data = self._parse_json(response)
-        token = data.get("result") or data.get("token") or data.get("access_token")
+        token = data.get("token") or data.get("jwt") or data.get("access_token")
         if not isinstance(token, str) or not token:
             raise VipHTTPError("Login response did not include a token.")
         self._token = token
@@ -813,7 +856,7 @@ class VipHttpClient:
             return False
         self._token = None
         try:
-            self._authorization_token()
+            self._login()
         except VipHTTPError:
             return False
         return True
@@ -891,10 +934,11 @@ class VipGrantResult:
 
 
 class PlayerIDModal(Modal):
-    def __init__(self, database: Database, notifier: ModeratorNotifier):
+    def __init__(self, parent_view: "CombinedView"):
         super().__init__(title="Please input Player-ID", custom_id="frontline-pass-player-id-modal")
-        self.database = database
-        self.notifier = notifier
+        self._parent_view = parent_view
+        self.database = parent_view.database
+        self.notifier = parent_view.notifier
         self.player_id = TextInput(
             label="T17 / Steam ID",
             placeholder="12345678901234567",
@@ -930,6 +974,7 @@ class PlayerIDModal(Modal):
 
         await interaction.response.send_message(message, ephemeral=True)
         schedule_ephemeral_cleanup(interaction)
+        await self._parent_view.bot.refresh_announcement_message()
 
 
 class PersistentView(View):
@@ -938,13 +983,21 @@ class PersistentView(View):
 
 
 class CombinedView(PersistentView):
-    def __init__(self, config: AppConfig, database: Database, vip_service: VipService, notifier: ModeratorNotifier) -> None:
+    def __init__(
+        self,
+        bot: "FrontlinePassBot",
+        config: AppConfig,
+        database: Database,
+        vip_service: VipService,
+        notifier: ModeratorNotifier,
+    ) -> None:
         super().__init__()
+        self.bot = bot
         self.config = config
         self.database = database
         self.vip_service = vip_service
         self.notifier = notifier
-        self.give_vip_button.label = f"Get VIP ({self.config.vip_duration_label} hours)"
+        self._refresh_button_label()
 
     @discord.ui.button(label="Register", style=ButtonStyle.danger, custom_id="frontline-pass-register")
     async def register_button(self, interaction: discord.Interaction, _: Button) -> None:
@@ -957,7 +1010,7 @@ class CombinedView(PersistentView):
             schedule_ephemeral_cleanup(interaction)
             return
 
-        await interaction.response.send_modal(PlayerIDModal(self.database, self.notifier))
+        await interaction.response.send_modal(PlayerIDModal(self))
 
     @discord.ui.button(label="Get VIP", style=ButtonStyle.green, custom_id="frontline-pass-get-vip")
     async def give_vip_button(self, interaction: discord.Interaction, _: Button) -> None:
@@ -971,8 +1024,9 @@ class CombinedView(PersistentView):
             schedule_ephemeral_cleanup(interaction)
             return
 
+        duration_hours = self.bot.vip_duration_hours
         local_time = datetime.now(self.config.timezone)
-        expiration_time_local = local_time + timedelta(hours=self.config.vip_duration_hours)
+        expiration_time_local = local_time + timedelta(hours=duration_hours)
         expiration_time_utc = expiration_time_local.astimezone(pytz.utc)
         expiration_time_utc_str = expiration_time_utc.strftime("%Y-%m-%d %H:%M:%S")
         expiration_time_iso = expiration_time_utc.isoformat()
@@ -1027,6 +1081,13 @@ class CombinedView(PersistentView):
         schedule_ephemeral_cleanup(interaction, message=followup_message)
 
 
+    def _refresh_button_label(self) -> None:
+        self.give_vip_button.label = f"Get VIP ({self.bot.vip_duration_hours:g} hours)"
+
+    def refresh_vip_label(self) -> None:
+        self._refresh_button_label()
+
+
 def create_database(config: AppConfig) -> Database:
     return Database(config.database_path, config.database_table)
 
@@ -1041,9 +1102,10 @@ class FrontlinePassBot(commands.Bot):
         self.notifier = ModeratorNotifier(config)
         self.persistent_view: Optional[CombinedView] = None
         self.announcement_manager = AnnouncementManager(config, database)
+        self._vip_duration_hours = self._load_vip_duration()
 
     async def setup_hook(self) -> None:
-        self.persistent_view = CombinedView(self.config, self.database, self.vip_service, self.notifier)
+        self.persistent_view = CombinedView(self, self.config, self.database, self.vip_service, self.notifier)
         self.add_view(self.persistent_view)
         await self._register_commands()
         await self.tree.sync()
@@ -1056,7 +1118,46 @@ class FrontlinePassBot(commands.Bot):
         if not self.persistent_view:
             logging.error("Persistent view not initialised; cannot refresh announcement message.")
             return
-        await self.announcement_manager.ensure(self, self.persistent_view)
+        await self.announcement_manager.ensure(self, self.persistent_view, self.vip_duration_hours)
+
+    @property
+    def vip_duration_hours(self) -> float:
+        return self._vip_duration_hours
+
+    def _user_has_moderator_privileges(self, user: discord.abc.User) -> bool:
+        permissions = getattr(user, "guild_permissions", None)  # type: ignore[attr-defined]
+        if permissions and permissions.administrator:
+            return True
+        role_id = self.config.moderator_role_id
+        if role_id and hasattr(user, "roles"):
+            for role in getattr(user, "roles", []):  # type: ignore[assignment]
+                if getattr(role, "id", None) == role_id:
+                    return True
+        return False
+
+    def _load_vip_duration(self) -> float:
+        stored_value = self.database.get_metadata(VIP_DURATION_METADATA_KEY)
+        if stored_value:
+            try:
+                parsed = float(stored_value)
+                if parsed > 0:
+                    logging.info("Loaded persisted VIP duration: %.2f hours", parsed)
+                    return parsed
+                logging.warning(
+                    "Ignoring persisted VIP duration %.2f because it is not greater than zero.", parsed
+                )
+            except ValueError:
+                logging.warning("Failed to parse stored VIP duration %r; falling back to config.", stored_value)
+        # Persist default so future restarts know it
+        self.database.set_metadata(VIP_DURATION_METADATA_KEY, str(self.config.vip_duration_hours))
+        return self.config.vip_duration_hours
+
+    async def set_vip_duration_hours(self, hours: float) -> None:
+        self._vip_duration_hours = hours
+        self.database.set_metadata(VIP_DURATION_METADATA_KEY, str(hours))
+        if self.persistent_view:
+            self.persistent_view.refresh_vip_label()
+        await self.refresh_announcement_message()
 
     async def _register_commands(self) -> None:
         @self.tree.command(
@@ -1086,6 +1187,7 @@ class FrontlinePassBot(commands.Bot):
             message = await self.announcement_manager.ensure(
                 self,
                 self.persistent_view,
+                self.vip_duration_hours,
                 force_new=True,
             )
             if message:
@@ -1104,6 +1206,38 @@ class FrontlinePassBot(commands.Bot):
                 schedule_ephemeral_cleanup(interaction, message=followup_message)
 
 
+        @self.tree.command(
+            name="set_vip_duration",
+            description="Set the VIP duration in hours.",
+        )
+        @app_commands.describe(hours="Number of hours that VIP access should last")
+        async def set_vip_duration(interaction: discord.Interaction, hours: float) -> None:
+            if not self._user_has_moderator_privileges(interaction.user):
+                await interaction.response.send_message(
+                    "You need moderator permissions to use this command.",
+                    ephemeral=True,
+                )
+                schedule_ephemeral_cleanup(interaction)
+                return
+
+            if hours <= 0:
+                await interaction.response.send_message(
+                    "VIP duration must be greater than zero hours.",
+                    ephemeral=True,
+                )
+                schedule_ephemeral_cleanup(interaction)
+                return
+
+            await interaction.response.defer(ephemeral=True)
+            await self.set_vip_duration_hours(hours)
+            followup_message = await interaction.followup.send(
+                f"VIP duration updated to {hours:g} hours.",
+                ephemeral=True,
+                wait=True,
+            )
+            schedule_ephemeral_cleanup(interaction, message=followup_message)
+
+
 def create_bot(config: AppConfig, database: Database, vip_service: VipService) -> commands.Bot:
     return FrontlinePassBot(config, database, vip_service)
 
@@ -1118,3 +1252,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+

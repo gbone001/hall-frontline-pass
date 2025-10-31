@@ -44,9 +44,11 @@ On first launch the bot posts the control panel in your target channel and creat
 | `DATABASE_TABLE` | Optional | Legacy option kept for backwards compatibility; ignored by the JSON backend. |
 | `ANNOUNCEMENT_MESSAGE_ID` | Optional | Reuse an existing Discord message for the control panel. |
 | `MODERATION_CHANNEL_ID`, `MODERATOR_ROLE_ID` | Optional | Where (and who) to ping when duplicate T17 IDs are detected. |
-| `CRCON_HTTP_BASE_URL` | Optional | CRCON host (no `/api` suffix needed; the bot appends it). |
+| `CRCON_HTTP_BASE_URL` | Optional | CRCON host (omit `/api`; the bot appends it automatically). |
 | `CRCON_HTTP_BEARER_TOKEN` | Optional | Pre-generated CRCON token. |
 | `CRCON_HTTP_USERNAME`, `CRCON_HTTP_PASSWORD` | Optional | CRCON login credentials. Supply these instead of a bearer token if you want automatic logins and token refreshes. |
+| `CRCON_HTTP_VERIFY` | Optional | `true` by default. Set to `false` when using self-signed certificates. |
+| `CRCON_HTTP_TIMEOUT` | Optional | CRCON HTTP timeout in seconds (default `20`). |
 
 The bot validates required settings on startup and exits with a clear error when something is missing or malformed.
 
@@ -67,11 +69,13 @@ ANNOUNCEMENT_MESSAGE_ID=
 MODERATION_CHANNEL_ID=
 MODERATOR_ROLE_ID=
 
-# CRCON HTTP API (optional - /api is appended automatically)
+# CRCON HTTP API (optional - do NOT include /api)
 CRCON_HTTP_BASE_URL=https://crcon.example.com:8010
 CRCON_HTTP_BEARER_TOKEN=
 CRCON_HTTP_USERNAME=vipbot
 CRCON_HTTP_PASSWORD=supersecret
+CRCON_HTTP_VERIFY=true
+CRCON_HTTP_TIMEOUT=20
 
 # RCON
 RCON_HOST=203.0.113.10
@@ -91,6 +95,29 @@ Admins can refresh the message at any time with `/repost_frontline_controls`.
 
 - **Local / bare metal** - run `python frontline-pass.py` under your favorite supervisor (systemd, pm2, tmux). Ensure the working directory is writable so the JSON file can be updated.
 - **Railway** - the repo ships with `Procfile` and `railway.toml`. Attach a volume (e.g. `/data`) and set `DATABASE_PATH=/data/vip-data.json` to persist player links between deploys. Configure environment variables through the Railway dashboard or CLI.
+
+## Quick Troubleshooting Checklist
+
+Run these from the same host that runs the bot to confirm CRCON connectivity:
+
+1. **Login endpoint**
+   ```bash
+   curl -sS -X POST https://<crcon-host>:8010/api/login \
+     -H 'Content-Type: application/json' \
+     -d '{"username":"<user>","password":"<pass>"}'
+   ```
+   Expect a JSON payload containing a `token`, `jwt`, or `access_token` field.
+
+2. **Authorized VIP grant**
+   ```bash
+   curl -sS -X POST https://<crcon-host>:8010/api/add_vip \
+     -H 'Authorization: Bearer <token>' \
+     -H 'Content-Type: application/json' \
+     -d '{"player_id":"76561198000000000","description":"frontline-pass","expiration":"2025-11-01T12:00:00Z"}'
+   ```
+   A 200 response confirms the account has the `api.can_add_vip` permission.
+
+3. **TLS issues?** If either request fails with certificate errors and you trust the endpoint, repeat with `curl -k` and set `CRCON_HTTP_VERIFY=false` in `.env` so the bot also skips certificate validation.
 
 ## Requirements
 
