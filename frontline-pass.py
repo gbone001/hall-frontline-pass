@@ -297,18 +297,18 @@ def load_config() -> AppConfig:
     provided_http_values = [http_base_url, http_username, http_password]
     if any(provided_http_values):
         trimmed_base = (http_base_url or "").strip()
-        trimmed_user = (http_username or "").strip()
+        trimmed_username = (http_username or "").strip()
         if not trimmed_base:
             errors.append("CRCON_HTTP_BASE_URL is required when using the HTTP API integration")
-        if not trimmed_user:
+        if not trimmed_username:
             errors.append("CRCON_HTTP_USERNAME is required when using the HTTP API integration")
         if http_password is None:
             errors.append("CRCON_HTTP_PASSWORD is required when using the HTTP API integration")
 
-        if trimmed_base and trimmed_user and http_password is not None:
+        if trimmed_base and trimmed_username and http_password is not None:
             http_credentials = HttpCredentials(
                 base_url=trimmed_base.rstrip("/"),
-                username=trimmed_user,
+                username=trimmed_username,
                 password=http_password,
             )
 
@@ -636,20 +636,19 @@ class VipService:
         self._config = config
         self._http_client = VipHttpClient(config.http_credentials) if config.http_credentials else None
 
-    def grant_vip(self, player_id: str, comment: str) -> VipGrantResult:
+    def grant_vip(self, player_id: str, comment: str, expiration_iso: Optional[str]) -> VipGrantResult:
         status_lines: List[str] = []
         detail = ""
         overall_success = False
 
         if self._http_client:
             try:
-                response = self._http_client.add_vip(player_id, comment)
-                message = (
-                    response.get("message")
-                    or response.get("StatusMessage")
-                    or response.get("statusMessage")
-                    or "HTTP API add_vip succeeded."
-                )
+                response = self._http_client.add_vip(player_id, comment, expiration_iso)
+                message = response.get("result")
+                if isinstance(message, dict):
+                    message = message.get("result") or message
+                if message is None:
+                    message = "HTTP API add_vip succeeded."
                 status_lines.append(f"HTTP API: {message}")
                 detail = str(message)
                 overall_success = True
@@ -725,9 +724,16 @@ class VipHttpClient:
         self.session = requests.Session()
         self._token: Optional[str] = None
 
+    def _endpoint(self, name: str) -> str:
+        return f"{self.credentials.base_url}/{name.lstrip('/')}"
+
     def login(self) -> str:
-        url = f"{self.credentials.base_url}/login"
-        payload = {"username": self.credentials.username, "password": self.credentials.password}
+        """Authenticate with CRCON and cache the bearer token."""
+        url = self._endpoint("login")
+        payload = {
+            "username": self.credentials.username,
+            "password": self.credentials.password,
+        }
         response = self.session.post(url, json=payload, timeout=self.timeout)
         if response.status_code != 200:
             raise VipHTTPError(f"Login failed with status {response.status_code}: {response.text}")
@@ -736,36 +742,63 @@ class VipHttpClient:
         token = data.get("result") or data.get("token") or data.get("access_token")
         if not token:
             raise VipHTTPError("Login response did not include an access token.")
+
         self._token = token
         return token
 
-    def add_vip(self, player_id: str, comment: str) -> Dict[str, Any]:
+    def add_vip(
+        self,
+        player_id: str,
+        description: str,
+        expiration_iso: Optional[str],
+    ) -> Dict[str, Any]:
         if not self._token:
             self.login()
 
-        url = f"{self.credentials.base_url}/add_vip"
-        payload = {"player_id": player_id, "comment": comment}
-        response = self.session.post(url, headers=self._auth_headers(), json=payload, timeout=self.timeout)
+        payload: Dict[str, Any] = {
+            "player_id": player_id,
+            "description": description,
+        }
+        if expiration_iso:
+            payload["expiration"] = expiration_iso
+
+        try:
+            response = self.session.post(
+                self._endpoint("add_vip"),
+                json=payload,
+                headers=self._auth_headers(),
+                timeout=self.timeout,
+            )
+        except requests.exceptions.RequestException as exc:
+            raise VipHTTPError(f"HTTP API request failed: {exc}") from exc
 
         if response.status_code == 401:
             self._token = None
             self.login()
-            response = self.session.post(url, headers=self._auth_headers(), json=payload, timeout=self.timeout)
+            response = self.session.post(
+                self._endpoint("add_vip"),
+                json=payload,
+                headers=self._auth_headers(),
+                timeout=self.timeout,
+            )
 
         if response.status_code != 200:
-            raise VipHTTPError(f"add_vip failed with status {response.status_code}: {response.text}")
+            raise VipHTTPError(
+                f"add_vip failed with status {response.status_code}: {response.text}"
+            )
 
         data = self._parse_json(response)
-        if isinstance(data, dict) and data.get("failed"):
+        if data.get("failed"):
             raise VipHTTPError(f"add_vip reported failure: {data.get('error') or data}")
         return data
 
     def _auth_headers(self) -> Dict[str, str]:
         if not self._token:
-            raise VipHTTPError("Missing bearer token; call login() first.")
+            raise VipHTTPError("HTTP token missing; call login() first.")
         return {
             "Authorization": f"Bearer {self._token}",
             "Accept": "application/json",
+            "Content-Type": "application/json",
         }
 
     @staticmethod
@@ -857,6 +890,7 @@ class CombinedView(PersistentView):
         expiration_time_local = local_time + timedelta(hours=self.config.vip_duration_hours)
         expiration_time_utc = expiration_time_local.astimezone(pytz.utc)
         expiration_time_utc_str = expiration_time_utc.strftime("%Y-%m-%d %H:%M:%S")
+        expiration_time_iso = expiration_time_utc.isoformat()
         comment = f"Discord VIP for {interaction.user.display_name} until {expiration_time_utc_str} UTC"
 
         await interaction.response.defer(ephemeral=True)
@@ -865,6 +899,7 @@ class CombinedView(PersistentView):
                 self.vip_service.grant_vip,
                 steam_id,
                 comment,
+                expiration_time_iso,
             )
         except RconError as exc:
             logging.exception("Failed to grant VIP for player %s", steam_id)
