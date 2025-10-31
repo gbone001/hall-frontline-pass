@@ -1011,6 +1011,7 @@ class VipHttpClient:
         headers: Dict[str, str] = {
             "Accept": "application/json",
             "Content-Type": "application/json",
+            "Connection": "keep-alive",
         }
         if include_auth:
             token = self._authorization_token()
@@ -1044,12 +1045,14 @@ class VipHttpClient:
             timeout=self.timeout,
         )
         if response.status_code != 200:
-            raise VipHTTPError(f"Login failed with status {response.status_code}: {response.text}")
+            raise VipHTTPError(
+                f"Login failed with status {response.status_code}: {response.text}"
+            )
 
         data = self._parse_json(response)
         token = self._extract_token(data)
         if not isinstance(token, str) or not token:
-            raise VipHTTPError("Login response did not include a token.")
+            raise VipHTTPError(f"Login response did not include a token. Payload: {data}")
         self._token = token
 
     def _refresh_token_if_possible(self) -> bool:
@@ -1078,7 +1081,11 @@ class VipHttpClient:
             json=json_payload,
             timeout=self.timeout,
         )
-        if response.status_code == 401 and self._refresh_token_if_possible():
+        if (
+            response.status_code == 401
+            and not self.credentials.bearer_token
+            and self._refresh_token_if_possible()
+        ):
             headers = self._headers()
             response = self.session.request(
                 method,
