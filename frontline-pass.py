@@ -7,7 +7,10 @@ import json
 import logging
 import os
 import socket
+import sqlite3
 import struct
+import time
+
 import requests
 import threading
 from dataclasses import dataclass
@@ -425,9 +428,15 @@ class Database:
         self._lock = threading.Lock()
         self._data: Dict[str, Any] = {"players": {}, "metadata": {}}
         self._ensure_database_directory()
-        self._load()
-        self._save()  # ensure a file exists on disk
-        logging.info("Using JSON database file at %s", self._path)
+        self._backend = "json"
+        if self._is_sqlite_database():
+            self._backend = "sqlite"
+            self._setup_sqlite_backend()
+            logging.info("Using legacy SQLite database at %s", self._path)
+        else:
+            self._load()
+            self._save()  # ensure a file exists on disk
+            logging.info("Using JSON database file at %s", self._path)
 
     def _ensure_database_directory(self) -> None:
         directory = os.path.dirname(os.path.abspath(self._path))
@@ -435,6 +444,8 @@ class Database:
             os.makedirs(directory, exist_ok=True)
 
     def _load(self) -> None:
+        if self._using_sqlite():
+            return
         data: Dict[str, Any] = {}
         try:
             with open(self._path, "r", encoding="utf-8") as handle:
@@ -466,13 +477,135 @@ class Database:
         with self._lock:
             self._data = {"players": players, "metadata": metadata}
 
+    def _is_sqlite_database(self) -> bool:
+        if not self._path or not os.path.exists(self._path) or os.path.isdir(self._path):
+            return False
+        try:
+            with open(self._path, "rb") as handle:
+                header = handle.read(16)
+        except OSError:
+            return False
+        return header.startswith(b"SQLite format 3")
+
+    def _setup_sqlite_backend(self) -> None:
+        connection = self._sqlite_connection()
+        try:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS "{self.table}" (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        discord_id TEXT UNIQUE NOT NULL,
+                        steam_id TEXT UNIQUE NOT NULL
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )
+                    """
+                )
+                connection.commit()
+            finally:
+                cursor.close()
+        finally:
+            connection.close()
+
+    def _sqlite_connection(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self._path, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _using_sqlite(self) -> bool:
+        return getattr(self, "_backend", "json") == "sqlite"
+
+    def _sqlite_fetch_value(
+        self,
+        query: str,
+        params: Tuple[Any, ...],
+        *,
+        column: Optional[str] = None,
+    ) -> Optional[str]:
+        with self._lock:
+            connection = self._sqlite_connection()
+            try:
+                cursor = connection.cursor()
+                try:
+                    cursor.execute(query, params)
+                    row = cursor.fetchone()
+                    if not row:
+                        return None
+                    if isinstance(row, sqlite3.Row):
+                        value = row[column] if column else row[0]
+                    else:
+                        if column:
+                            value = row[column]  # type: ignore[index]
+                        else:
+                            value = row[0]
+                    if value is None:
+                        return None
+                    if isinstance(value, str):
+                        return value
+                    return str(value)
+                finally:
+                    cursor.close()
+            finally:
+                connection.close()
+
+    def _sqlite_upsert_player(self, discord_id: str, steam_id: str) -> None:
+        discord_id_str = str(discord_id).strip()
+        steam_id_str = str(steam_id).strip()
+        if not discord_id_str or not steam_id_str:
+            raise ValueError("Discord ID and Steam ID must not be empty.")
+
+        with self._lock:
+            connection = self._sqlite_connection()
+            try:
+                cursor = connection.cursor()
+                try:
+                    cursor.execute(
+                        f'SELECT discord_id FROM "{self.table}" WHERE steam_id = ?',
+                        (steam_id_str,),
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        existing_discord = row["discord_id"] if isinstance(row, sqlite3.Row) else row[0]
+                        if existing_discord is not None and str(existing_discord) != discord_id_str:
+                            raise DuplicateSteamIDError(steam_id_str, str(existing_discord))
+                    cursor.execute(
+                        f'''
+                        INSERT INTO "{self.table}" (discord_id, steam_id)
+                        VALUES (?, ?)
+                        ON CONFLICT(discord_id) DO UPDATE SET steam_id=excluded.steam_id
+                        ''',
+                        (discord_id_str, steam_id_str),
+                    )
+                    connection.commit()
+                finally:
+                    cursor.close()
+            finally:
+                connection.close()
+
     def _save_locked(self) -> None:
         tmp_path = f"{self._path}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as handle:
             json.dump(self._data, handle, indent=2, sort_keys=True)
-        os.replace(tmp_path, self._path)
+        for attempt in range(3):
+            try:
+                os.replace(tmp_path, self._path)
+                return
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.1)
 
     def _save(self) -> None:
+        if self._using_sqlite():
+            return
         with self._lock:
             self._save_locked()
 
@@ -480,6 +613,9 @@ class Database:
         return self._data.setdefault("players", {})
 
     def upsert_player(self, discord_id: str, steam_id: str) -> None:
+        if self._using_sqlite():
+            self._sqlite_upsert_player(discord_id, steam_id)
+            return
         with self._lock:
             players = self._players()
             for existing_discord_id, existing_steam in players.items():
@@ -489,10 +625,20 @@ class Database:
             self._save_locked()
 
     def fetch_player(self, discord_id: str) -> Optional[str]:
+        if self._using_sqlite():
+            return self._sqlite_fetch_value(
+                f'SELECT steam_id FROM "{self.table}" WHERE discord_id = ?',
+                (discord_id,),
+            )
         with self._lock:
             return self._players().get(discord_id)
 
     def fetch_discord_id_for_steam(self, steam_id: str) -> Optional[str]:
+        if self._using_sqlite():
+            return self._sqlite_fetch_value(
+                f'SELECT discord_id FROM "{self.table}" WHERE steam_id = ?',
+                (steam_id,),
+            )
         with self._lock:
             for discord_id, stored_steam in self._players().items():
                 if stored_steam == steam_id:
@@ -500,21 +646,72 @@ class Database:
         return None
 
     def set_metadata(self, key: str, value: str) -> None:
+        if self._using_sqlite():
+            with self._lock:
+                connection = self._sqlite_connection()
+                try:
+                    cursor = connection.cursor()
+                    try:
+                        cursor.execute(
+                            """
+                            INSERT INTO metadata (key, value)
+                            VALUES (?, ?)
+                            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                            """,
+                            (key, value),
+                        )
+                        connection.commit()
+                    finally:
+                        cursor.close()
+                finally:
+                    connection.close()
+            return
         with self._lock:
             self._data.setdefault("metadata", {})[key] = value
             self._save_locked()
 
     def get_metadata(self, key: str) -> Optional[str]:
+        if self._using_sqlite():
+            return self._sqlite_fetch_value("SELECT value FROM metadata WHERE key = ?", (key,))
         with self._lock:
             return self._data.get("metadata", {}).get(key)
 
     def delete_metadata(self, key: str) -> None:
+        if self._using_sqlite():
+            with self._lock:
+                connection = self._sqlite_connection()
+                try:
+                    cursor = connection.cursor()
+                    try:
+                        cursor.execute("DELETE FROM metadata WHERE key = ?", (key,))
+                        connection.commit()
+                    finally:
+                        cursor.close()
+                finally:
+                    connection.close()
+            return
         with self._lock:
             metadata = self._data.setdefault("metadata", {})
             metadata.pop(key, None)
             self._save_locked()
 
     def count_players(self) -> int:
+        if self._using_sqlite():
+            with self._lock:
+                connection = self._sqlite_connection()
+                try:
+                    cursor = connection.cursor()
+                    try:
+                        cursor.execute(f'SELECT COUNT(*) AS total FROM "{self.table}"')
+                        row = cursor.fetchone()
+                        if not row:
+                            return 0
+                        value = row["total"] if isinstance(row, sqlite3.Row) else row[0]
+                        return int(value or 0)
+                    finally:
+                        cursor.close()
+                finally:
+                    connection.close()
         with self._lock:
             return len(self._players())
 
@@ -791,11 +988,15 @@ class VipHttpClient:
     def __init__(
         self,
         credentials: HttpCredentials,
-        timeout: float = 10.0,
+        timeout: Optional[float] = None,
         session: Optional[requests.Session] = None,
     ) -> None:
         self.credentials = credentials
-        self.timeout = credentials.timeout or timeout
+        if timeout is None:
+            timeout = credentials.timeout
+        if timeout is None:
+            timeout = 10.0
+        self.timeout = timeout
         self.session = session or requests.Session()
         self.session.verify = credentials.verify
         self._token: Optional[str] = None
@@ -818,12 +1019,12 @@ class VipHttpClient:
         return headers
 
     def _authorization_token(self) -> Optional[str]:
+        if self.credentials.bearer_token:
+            return self.credentials.bearer_token
         if self._has_login_credentials():
             if not self._token:
                 self._login()
             return self._token
-        if self.credentials.bearer_token:
-            return self.credentials.bearer_token
         return None
 
     def _has_login_credentials(self) -> bool:
@@ -846,7 +1047,7 @@ class VipHttpClient:
             raise VipHTTPError(f"Login failed with status {response.status_code}: {response.text}")
 
         data = self._parse_json(response)
-        token = data.get("token") or data.get("jwt") or data.get("access_token")
+        token = self._extract_token(data)
         if not isinstance(token, str) or not token:
             raise VipHTTPError("Login response did not include a token.")
         self._token = token
@@ -887,6 +1088,25 @@ class VipHttpClient:
                 timeout=self.timeout,
             )
         return response
+
+    @staticmethod
+    def _extract_token(payload: Any) -> Optional[str]:
+        if isinstance(payload, str):
+            return payload or None
+        if not isinstance(payload, dict):
+            return None
+
+        for key in ("token", "jwt", "access_token", "accessToken"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+
+        for key in ("result", "data"):
+            nested = payload.get(key)
+            token = VipHttpClient._extract_token(nested)
+            if token:
+                return token
+        return None
 
     def add_vip(
         self,

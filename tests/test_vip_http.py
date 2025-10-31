@@ -1,5 +1,8 @@
+import gc
 import importlib.util
 import pathlib
+import sqlite3
+import tempfile
 import unittest
 from unittest import mock
 
@@ -18,6 +21,7 @@ HttpCredentials = frontline_pass.HttpCredentials
 VipHttpClient = frontline_pass.VipHttpClient
 VipHTTPError = frontline_pass.VipHTTPError
 VipService = frontline_pass.VipService
+Database = frontline_pass.Database
 
 
 class DummyResponse:
@@ -35,9 +39,10 @@ class DummySession:
         self.response = response
         self.calls = []
 
-    def post(self, url, json=None, headers=None, timeout=None):
+    def request(self, method, url, json=None, headers=None, timeout=None):
         self.calls.append(
             {
+                "method": method,
                 "url": url,
                 "json": json,
                 "headers": headers,
@@ -45,6 +50,9 @@ class DummySession:
             }
         )
         return self.response
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        return self.request("POST", url, json=json, headers=headers, timeout=timeout)
 
 
 class VipHttpClientTests(unittest.TestCase):
@@ -62,6 +70,7 @@ class VipHttpClientTests(unittest.TestCase):
         self.assertEqual(len(session.calls), 1)
         call = session.calls[0]
         self.assertEqual(call["url"], "https://example/api/add_vip")
+        self.assertEqual(call["method"], "POST")
         self.assertEqual(call["timeout"], 5.0)
         self.assertEqual(
             call["json"],
@@ -83,6 +92,21 @@ class VipHttpClientTests(unittest.TestCase):
 
         with self.assertRaises(VipHTTPError):
             client.add_vip("player-id", "desc", None)
+
+    def test_bearer_token_preferred_over_login(self) -> None:
+        session = DummySession(DummyResponse(200, {"result": "ok"}))
+        credentials = HttpCredentials(
+            base_url="https://example/api",
+            bearer_token="abc123",
+            username="user",
+            password="pass",
+        )
+        client = VipHttpClient(credentials, session=session)
+
+        client.add_vip("player-id", "desc", None)
+
+        self.assertEqual(len(session.calls), 1)
+        self.assertNotIn("login", session.calls[0]["url"])
 
 
 class VipServiceTests(unittest.TestCase):
@@ -120,6 +144,67 @@ class VipServiceTests(unittest.TestCase):
         fake_http_client.add_vip.assert_called_once_with("steam123", "comment", None)
         service._grant_vip_via_rcon.assert_not_called()  # type: ignore[attr-defined]
         self.assertIn("HTTP API", result.status_lines[0])
+
+
+class DatabaseTests(unittest.TestCase):
+    def test_uses_legacy_sqlite_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = pathlib.Path(tmpdir) / "legacy.db"
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute(
+                    """
+                    CREATE TABLE vip_players (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        discord_id TEXT UNIQUE NOT NULL,
+                        steam_id TEXT UNIQUE NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    'INSERT INTO vip_players (discord_id, steam_id) VALUES (?, ?)',
+                    ("123456", "7654321"),
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )
+                    """
+                )
+                connection.execute(
+                    'INSERT INTO metadata (key, value) VALUES (?, ?)',
+                    ("vip_duration_hours", "4"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            database = Database(str(db_path), "vip_players")
+
+            self.assertEqual(database.fetch_player("123456"), "7654321")
+            self.assertEqual(database.get_metadata("vip_duration_hours"), "4")
+            self.assertEqual(database.count_players(), 1)
+
+            database.upsert_player("654321", "999888777")
+            database.set_metadata("announcement_message_id", "42")
+            self.assertEqual(database.fetch_player("654321"), "999888777")
+            self.assertEqual(database.get_metadata("announcement_message_id"), "42")
+            self.assertEqual(database.count_players(), 2)
+
+            # Re-open to ensure persistence
+            database = None
+            reopened = Database(str(db_path), "vip_players")
+            self.assertEqual(reopened.fetch_player("654321"), "999888777")
+            self.assertEqual(reopened.get_metadata("announcement_message_id"), "42")
+            self.assertEqual(reopened.count_players(), 2)
+            reopened = None
+            gc.collect()
+
+            with open(db_path, "rb") as handle:
+                header = handle.read(16)
+            self.assertTrue(header.startswith(b"SQLite format 3"))
 
 
 if __name__ == "__main__":
