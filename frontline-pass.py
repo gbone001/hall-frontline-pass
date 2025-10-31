@@ -1370,7 +1370,33 @@ class FrontlinePassBot(commands.Bot):
         self.persistent_view = CombinedView(self, self.config, self.database, self.vip_service, self.notifier)
         self.add_view(self.persistent_view)
         await self._register_commands()
-        await self.tree.sync()
+        # Optional: sync commands to specific guilds for instant availability
+        guild_ids_raw = os.getenv("COMMAND_GUILD_IDS") or os.getenv("COMMAND_GUILD_ID")
+        synced_any_guild = False
+        if guild_ids_raw:
+            try:
+                guild_ids = [int(x.strip()) for x in guild_ids_raw.split(",") if x.strip()]
+            except ValueError:
+                logging.warning("Invalid COMMAND_GUILD_IDS value %r; falling back to global sync.", guild_ids_raw)
+                guild_ids = []
+            for gid in guild_ids:
+                try:
+                    guild_obj = discord.Object(id=gid)
+                    self.tree.copy_global_to(guild=guild_obj)
+                    await self.tree.sync(guild=guild_obj)
+                    synced_any_guild = True
+                    logging.info("Slash commands synced to guild %s", gid)
+                except discord.DiscordException:
+                    logging.exception("Failed to sync slash commands to guild %s", gid)
+        if not synced_any_guild:
+            await self.tree.sync()
+            logging.info("Slash commands globally synced (may take up to 1 hour to appear).")
+        # Log registered commands
+        try:
+            cmd_names = ", ".join(sorted(cmd.name for cmd in self.tree.get_commands()))
+            logging.info("Registered slash commands: %s", cmd_names)
+        except Exception:
+            logging.exception("Unable to list registered slash commands")
 
     async def on_ready(self) -> None:
         logging.info("Bot is ready: %s", self.user)
