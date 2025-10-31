@@ -44,6 +44,7 @@ On first launch the bot posts the control panel in your target channel and creat
 | `DATABASE_TABLE` | Optional | Legacy option kept for backwards compatibility; ignored by the JSON backend. |
 | `ANNOUNCEMENT_MESSAGE_ID` | Optional | Reuse an existing Discord message for the control panel. |
 | `MODERATION_CHANNEL_ID`, `MODERATOR_ROLE_ID` | Optional | Where (and who) to ping when duplicate T17 IDs are detected. |
+| `COMMAND_GUILD_IDS` / `COMMAND_GUILD_ID` | Optional | Comma-separated guild IDs (or a single ID) to sync slash commands instantly to those servers. If unset, commands are synced globally (may take up to ~1 hour to propagate). |
 | `CRCON_HTTP_BASE_URL` | Optional | CRCON host (omit `/api`; the bot appends it automatically). |
 | `CRCON_HTTP_BEARER_TOKEN` | Optional | Pre-generated CRCON token. |
 | `CRCON_HTTP_USERNAME`, `CRCON_HTTP_PASSWORD` | Optional | CRCON login credentials. Supply these instead of a bearer token if you want automatic logins and token refreshes. |
