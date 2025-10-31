@@ -14,7 +14,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import discord
 import pytz
 from discord import ButtonStyle
-from discord.abc import MessageableChannel
+try:
+    from discord.abc import MessageableChannel
+except ImportError:  # discord.py>=2.4 renamed MessageableChannel -> Messageable
+    from discord.abc import Messageable as MessageableChannel
 from discord.ext import commands
 from discord.ui import Button, Modal, TextInput, View
 from dotenv import load_dotenv
