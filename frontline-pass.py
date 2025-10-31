@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -29,6 +30,23 @@ logging.basicConfig(level=logging.INFO)
 ANNOUNCEMENT_TITLE = "Frontline VIP Control Center"
 ANNOUNCEMENT_METADATA_KEY = "announcement_message_id"
 LAST_GRANT_METADATA_KEY = "last_vip_grant"
+
+
+def schedule_ephemeral_cleanup(
+    interaction: discord.Interaction,
+    *,
+    delay: float = 10.0,
+    message: Optional[discord.Message] = None,
+) -> None:
+    async def _cleanup() -> None:
+        await asyncio.sleep(delay)
+        with contextlib.suppress(discord.HTTPException, discord.NotFound):
+            if message is None:
+                await interaction.delete_original_response()
+            else:
+                await message.delete()
+
+    asyncio.create_task(_cleanup())
 
 
 class DuplicateSteamIDError(Exception):
@@ -205,8 +223,7 @@ def _optional_int(name: str) -> Optional[int]:
 @dataclass(frozen=True)
 class HttpCredentials:
     base_url: str
-    username: str
-    password: str
+    bearer_token: str
 
 
 @dataclass(frozen=True)
@@ -295,26 +312,22 @@ def load_config() -> AppConfig:
     announcement_message_id = _optional_int("ANNOUNCEMENT_MESSAGE_ID")
 
     http_base_url = os.getenv("CRCON_HTTP_BASE_URL")
-    http_username = os.getenv("CRCON_HTTP_USERNAME")
-    http_password = os.getenv("CRCON_HTTP_PASSWORD")
+    http_bearer_token = os.getenv("CRCON_HTTP_BEARER_TOKEN")
     http_credentials: Optional[HttpCredentials] = None
 
-    provided_http_values = [http_base_url, http_username, http_password]
+    provided_http_values = [http_base_url, http_bearer_token]
     if any(provided_http_values):
         trimmed_base = (http_base_url or "").strip()
-        trimmed_username = (http_username or "").strip()
         if not trimmed_base:
             errors.append("CRCON_HTTP_BASE_URL is required when using the HTTP API integration")
-        if not trimmed_username:
-            errors.append("CRCON_HTTP_USERNAME is required when using the HTTP API integration")
-        if http_password is None:
-            errors.append("CRCON_HTTP_PASSWORD is required when using the HTTP API integration")
+        trimmed_token = (http_bearer_token or "").strip()
+        if not trimmed_token:
+            errors.append("CRCON_HTTP_BEARER_TOKEN is required when using the HTTP API integration")
 
-        if trimmed_base and trimmed_username and http_password is not None:
+        if trimmed_base and trimmed_token:
             http_credentials = HttpCredentials(
                 base_url=trimmed_base.rstrip("/"),
-                username=trimmed_username,
-                password=http_password,
+                bearer_token=trimmed_token,
             )
 
     if errors:
@@ -723,33 +736,25 @@ class VipHTTPError(Exception):
 
 
 class VipHttpClient:
-    def __init__(self, credentials: HttpCredentials, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        credentials: HttpCredentials,
+        timeout: float = 10.0,
+        session: Optional[requests.Session] = None,
+    ) -> None:
         self.credentials = credentials
         self.timeout = timeout
-        self.session = requests.Session()
-        self._token: Optional[str] = None
+        self.session = session or requests.Session()
 
     def _endpoint(self, name: str) -> str:
         return f"{self.credentials.base_url}/{name.lstrip('/')}"
 
-    def login(self) -> str:
-        """Authenticate with CRCON and cache the bearer token."""
-        url = self._endpoint("login")
-        payload = {
-            "username": self.credentials.username,
-            "password": self.credentials.password,
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.credentials.bearer_token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
         }
-        response = self.session.post(url, json=payload, timeout=self.timeout)
-        if response.status_code != 200:
-            raise VipHTTPError(f"Login failed with status {response.status_code}: {response.text}")
-
-        data = self._parse_json(response)
-        token = data.get("result") or data.get("token") or data.get("access_token")
-        if not token:
-            raise VipHTTPError("Login response did not include an access token.")
-
-        self._token = token
-        return token
 
     def add_vip(
         self,
@@ -757,9 +762,6 @@ class VipHttpClient:
         description: str,
         expiration_iso: Optional[str],
     ) -> Dict[str, Any]:
-        if not self._token:
-            self.login()
-
         payload: Dict[str, Any] = {
             "player_id": player_id,
             "description": description,
@@ -771,21 +773,11 @@ class VipHttpClient:
             response = self.session.post(
                 self._endpoint("add_vip"),
                 json=payload,
-                headers=self._auth_headers(),
+                headers=self._headers(),
                 timeout=self.timeout,
             )
         except requests.exceptions.RequestException as exc:
             raise VipHTTPError(f"HTTP API request failed: {exc}") from exc
-
-        if response.status_code == 401:
-            self._token = None
-            self.login()
-            response = self.session.post(
-                self._endpoint("add_vip"),
-                json=payload,
-                headers=self._auth_headers(),
-                timeout=self.timeout,
-            )
 
         if response.status_code != 200:
             raise VipHTTPError(
@@ -796,15 +788,6 @@ class VipHttpClient:
         if data.get("failed"):
             raise VipHTTPError(f"add_vip reported failure: {data.get('error') or data}")
         return data
-
-    def _auth_headers(self) -> Dict[str, str]:
-        if not self._token:
-            raise VipHTTPError("HTTP token missing; call login() first.")
-        return {
-            "Authorization": f"Bearer {self._token}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
 
     @staticmethod
     def _parse_json(response: requests.Response) -> Dict[str, Any]:
@@ -839,6 +822,7 @@ class PlayerIDModal(Modal):
         steam_id = self.player_id.value.strip()
         if not steam_id:
             await interaction.response.send_message("Player-ID cannot be empty.", ephemeral=True)
+            schedule_ephemeral_cleanup(interaction)
             return
 
         discord_id = str(interaction.user.id)
@@ -851,6 +835,7 @@ class PlayerIDModal(Modal):
                 "Error: Player-ID already exists. A moderator has been notified.",
                 ephemeral=True,
             )
+            schedule_ephemeral_cleanup(interaction)
             await self.notifier.notify_duplicate(interaction, exc.steam_id, exc.existing_discord_id)
             return
 
@@ -860,6 +845,7 @@ class PlayerIDModal(Modal):
             message = f"Your Player-ID {steam_id} has been saved!"
 
         await interaction.response.send_message(message, ephemeral=True)
+        schedule_ephemeral_cleanup(interaction)
 
 
 class PersistentView(View):
@@ -889,6 +875,7 @@ class CombinedView(PersistentView):
                 "You are not registered! Please use the register button first.",
                 ephemeral=True,
             )
+            schedule_ephemeral_cleanup(interaction)
             return
 
         local_time = datetime.now(self.config.timezone)
@@ -908,11 +895,21 @@ class CombinedView(PersistentView):
             )
         except RconError as exc:
             logging.exception("Failed to grant VIP for player %s", steam_id)
-            await interaction.followup.send(f"Error: VIP status could not be set: {exc}", ephemeral=True)
+            followup_message = await interaction.followup.send(
+                f"Error: VIP status could not be set: {exc}",
+                ephemeral=True,
+                wait=True,
+            )
+            schedule_ephemeral_cleanup(interaction, message=followup_message)
             return
         except Exception as exc:  # pragma: no cover
             logging.exception("Unexpected error while granting VIP for player %s: %s", steam_id, exc)
-            await interaction.followup.send("An unexpected error occurred while setting VIP status.", ephemeral=True)
+            followup_message = await interaction.followup.send(
+                "An unexpected error occurred while setting VIP status.",
+                ephemeral=True,
+                wait=True,
+            )
+            schedule_ephemeral_cleanup(interaction, message=followup_message)
             return
 
         readable_expiration = expiration_time_local.strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -926,13 +923,15 @@ class CombinedView(PersistentView):
         if isinstance(interaction.client, FrontlinePassBot):
             await interaction.client.refresh_announcement_message()
         status_summary = "\n".join(f"- {line}" for line in result.status_lines)
-        await interaction.followup.send(
+        followup_message = await interaction.followup.send(
             (
                 f"You now have VIP for {self.config.vip_duration_label} hours! "
                 f"Expiration: {readable_expiration}\n\n**Status**:\n{status_summary}"
             ),
             ephemeral=True,
+            wait=True,
         )
+        schedule_ephemeral_cleanup(interaction, message=followup_message)
 
 
 def create_database(config: AppConfig) -> Database:
@@ -978,14 +977,17 @@ class FrontlinePassBot(commands.Bot):
                     "You need administrator permissions to use this command.",
                     ephemeral=True,
                 )
+                schedule_ephemeral_cleanup(interaction)
                 return
 
             await interaction.response.defer(ephemeral=True)
             if not self.persistent_view:
-                await interaction.followup.send(
+                followup_message = await interaction.followup.send(
                     "The persistent view is not initialised yet. Try again shortly.",
                     ephemeral=True,
+                    wait=True,
                 )
+                schedule_ephemeral_cleanup(interaction, message=followup_message)
                 return
 
             message = await self.announcement_manager.ensure(
@@ -994,15 +996,19 @@ class FrontlinePassBot(commands.Bot):
                 force_new=True,
             )
             if message:
-                await interaction.followup.send(
+                followup_message = await interaction.followup.send(
                     f"Frontline VIP controls reposted successfully (message ID {message.id}).",
                     ephemeral=True,
+                    wait=True,
                 )
+                schedule_ephemeral_cleanup(interaction, message=followup_message)
             else:
-                await interaction.followup.send(
+                followup_message = await interaction.followup.send(
                     "Unable to repost the VIP controls. Check the bot logs for details.",
                     ephemeral=True,
+                    wait=True,
                 )
+                schedule_ephemeral_cleanup(interaction, message=followup_message)
 
 
 def create_bot(config: AppConfig, database: Database, vip_service: VipService) -> commands.Bot:
