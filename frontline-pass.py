@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import contextlib
 import json
 import logging
@@ -402,6 +403,12 @@ def load_config() -> AppConfig:
     if errors:
         raise RuntimeError("Configuration error(s): " + "; ".join(errors))
 
+    # Type narrowing for static checkers
+    assert vip_duration_hours is not None
+    assert channel_id is not None
+    assert rcon_port is not None
+    assert rcon_version is not None
+
     return AppConfig(
         discord_token=discord_token,
         vip_duration_hours=vip_duration_hours,
@@ -437,6 +444,10 @@ class Database:
             self._load()
             self._save()  # ensure a file exists on disk
             logging.info("Using JSON database file at %s", self._path)
+
+    def info(self) -> Dict[str, str]:
+        """Return basic info for diagnostics and health/status commands."""
+        return {"path": self._path, "backend": getattr(self, "_backend", "json")}
 
     def _ensure_database_directory(self) -> None:
         directory = os.path.dirname(os.path.abspath(self._path))
@@ -764,7 +775,7 @@ class RconClient:
 
         try:
             self._xor_key = base64.b64decode(xor_content.strip())
-        except (base64.binascii.Error, AttributeError) as exc:
+        except (binascii.Error, AttributeError) as exc:
             raise RconError("Failed to decode XOR key from ServerConnect response.") from exc
 
         if not self._xor_key:
@@ -964,6 +975,11 @@ class ModeratorNotifier:
             except discord.DiscordException:
                 logging.exception("Failed to fetch moderation channel with id %s", self._channel_id)
                 return
+
+        # Ensure the channel supports send()
+        if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.DMChannel)):
+            logging.error("Configured moderation channel %s is not a messageable channel.", self._channel_id)
+            return
 
         role_mention = f"<@&{self._role_id}>" if self._role_id else ""
         existing_mention = f"<@{existing_discord_id}>" if existing_discord_id else "an unknown user"
@@ -1358,6 +1374,13 @@ class FrontlinePassBot(commands.Bot):
 
     async def on_ready(self) -> None:
         logging.info("Bot is ready: %s", self.user)
+        db_info = self.database.info()
+        logging.info(
+            "Database backend=%s path=%s; current VIP duration=%.2f hours",
+            db_info.get("backend"),
+            db_info.get("path"),
+            self.vip_duration_hours,
+        )
         await self.refresh_announcement_message()
 
     async def refresh_announcement_message(self) -> None:
@@ -1482,6 +1505,64 @@ class FrontlinePassBot(commands.Bot):
                 wait=True,
             )
             schedule_ephemeral_cleanup(interaction, message=followup_message)
+
+        # Alias command with requested name: /setvipduration (same behavior)
+        @self.tree.command(
+            name="setvipduration",
+            description="Set the VIP duration in hours (alias).",
+        )
+        @app_commands.describe(hours="Number of hours that VIP access should last")
+        async def setvipduration(interaction: discord.Interaction, hours: float) -> None:
+            if not self._user_has_moderator_privileges(interaction.user):
+                await interaction.response.send_message(
+                    "You need moderator permissions to use this command.",
+                    ephemeral=True,
+                )
+                schedule_ephemeral_cleanup(interaction)
+                return
+
+            if hours <= 0:
+                await interaction.response.send_message(
+                    "VIP duration must be greater than zero hours.",
+                    ephemeral=True,
+                )
+                schedule_ephemeral_cleanup(interaction)
+                return
+
+            await interaction.response.defer(ephemeral=True)
+            await self.set_vip_duration_hours(hours)
+            followup_message = await interaction.followup.send(
+                f"VIP duration updated to {hours:g} hours.",
+                ephemeral=True,
+                wait=True,
+            )
+            schedule_ephemeral_cleanup(interaction, message=followup_message)
+
+        @self.tree.command(
+            name="getvipduration",
+            description="Show the current VIP duration in hours.",
+        )
+        async def getvipduration(interaction: discord.Interaction) -> None:
+            await interaction.response.send_message(
+                f"Current VIP duration: {self.vip_duration_hours:g} hours.",
+                ephemeral=True,
+            )
+            schedule_ephemeral_cleanup(interaction)
+
+        @self.tree.command(
+            name="health",
+            description="Show bot health: VIP duration, player count, and DB backend/path.",
+        )
+        async def health(interaction: discord.Interaction) -> None:
+            db_info = self.database.info()
+            count = self.database.count_players()
+            msg = (
+                f"VIP duration: {self.vip_duration_hours:g} hours\n"
+                f"Registered players: {count}\n"
+                f"Database: {db_info.get('backend')} at {db_info.get('path')}"
+            )
+            await interaction.response.send_message(msg, ephemeral=True)
+            schedule_ephemeral_cleanup(interaction)
 
 
 def create_bot(config: AppConfig, database: Database, vip_service: VipService) -> commands.Bot:
