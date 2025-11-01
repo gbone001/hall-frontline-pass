@@ -1,0 +1,22 @@
+{
+  DISCORD_TOKEN: "your-discord-token",
+  CHANNEL_ID: 123456789012345678,
+  MODERATION_CHANNEL_ID: null,
+  MODERATOR_ROLE_ID: null,
+  ANNOUNCEMENT_MESSAGE_ID: null,
+  VIP_DURATION_HOURS: 72,
+  LOCAL_TIMEZONE: "Australia/Sydney",
+  RCON_HOST: "127.0.0.1",
+  RCON_PORT: 27015,
+  RCON_PASSWORD: "rcon-password",
+  RCON_VERSION: 2,
+  CRCON_HTTP_BASE_URL: "https://crcon.example.com",
+  CRCON_HTTP_BEARER_TOKEN: "",
+  CRCON_HTTP_USERNAME: "",
+  CRCON_HTTP_PASSWORD: "",
+  CRCON_HTTP_VERIFY: true,
+  CRCON_HTTP_TIMEOUT: 20,
+  DB_URL: "postgresql://user:password@host:5432/rcon",
+  DATABASE_PATH: "/data/vip-data.json",
+  DATABASE_TABLE: "vip_players"
+}

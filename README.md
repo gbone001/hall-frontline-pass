@@ -17,12 +17,14 @@ git clone https://github.com/yourusername/hall-frontline-pass.git
 cd hall-frontline-pass
 pip install -r requirements.txt
 
-copy .env.dist .env   # Windows
+copy config.example.jsonc config.jsonc   # Windows
 # or
-cp .env.dist .env     # macOS / Linux
+cp config.example.jsonc config.jsonc     # macOS / Linux
 ```
 
-Configure `.env`, then start the bot:
+Environment-specific overrides are optional. Create an `.env` only if you need to override values defined in `config.jsonc`.
+
+Configure `config.jsonc`, then start the bot:
 
 ```bash
 python frontline-pass.py
@@ -35,7 +37,7 @@ On first launch the bot posts the control panel in your target channel and creat
 The repo ships with a systemd template and helper script so the bot restarts automatically after crashes or reboots.
 
 1. Create the virtual environment and install dependencies (`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`).
-2. Adjust `.env` for your deployment (the service loads it from `/opt/hall-frontline-pass/.env` by default). If you cloned the repo elsewhere, edit `hall-frontline-pass.service.dist` or set `PROJECT_ROOT` related paths before installing.
+2. Adjust `config.jsonc` for your deployment (set `FRONTLINE_CONFIG_PATH` if you keep it outside the repository). Optional runtime overrides are still read from `/opt/hall-frontline-pass/.env` when present.
 3. Install the unit and enable it at boot:
    ```bash
    ./manage_frontline_pass.sh install        # copies hall-frontline-pass.service.dist -> /etc/systemd/system/hall-frontline-pass@.service
@@ -53,7 +55,9 @@ The systemd unit uses `Restart=on-failure`, so systemd automatically relaunches 
 
 ## Configuration Cheat Sheet
 
-| Variable | Required | Purpose |
+All primary settings live in `config.jsonc` (JSON5 syntax). Environment variables are optional overrides for deployments where you can’t use files (CI, containers, etc.).
+
+| Key | Required | Purpose |
 | --- | --- | --- |
 | `DISCORD_TOKEN` | Yes | Discord bot token. |
 | `VIP_DURATION_HOURS` | Yes | Duration of each VIP grant. |
@@ -74,41 +78,40 @@ The systemd unit uses `Restart=on-failure`, so systemd automatically relaunches 
 
 The bot validates required settings on startup and exits with a clear error when something is missing or malformed.
 
-### Sample `.env`
+### Sample `config.jsonc`
 
-```bash
-DISCORD_TOKEN=your-discord-bot-token
-VIP_DURATION_HOURS=24
-CHANNEL_ID=123456789012345678
-LOCAL_TIMEZONE=Australia/Sydney
+```json5
+{
+  DISCORD_TOKEN: "your-discord-token",
+  CHANNEL_ID: 123456789012345678,
+  VIP_DURATION_HOURS: 24,
+  LOCAL_TIMEZONE: "Australia/Sydney",
 
-# Storage (JSON)
-DATABASE_PATH=/data/vip-data.json
-DATABASE_TABLE=vip_players   # ignored, kept for compatibility
+  RCON_HOST: "203.0.113.10",
+  RCON_PORT: 21115,
+  RCON_PASSWORD: "your-rcon-password",
+  RCON_VERSION: 2,
 
-# Moderator notifications (optional)
-ANNOUNCEMENT_MESSAGE_ID=
-MODERATION_CHANNEL_ID=
-MODERATOR_ROLE_ID=
+  CRCON_HTTP_BASE_URL: "https://crcon.example.com:8010",
+  CRCON_HTTP_BEARER_TOKEN: "",
+  CRCON_HTTP_USERNAME: "vipbot",
+  CRCON_HTTP_PASSWORD: "supersecret",
+  CRCON_HTTP_VERIFY: true,
+  CRCON_HTTP_TIMEOUT: 20,
 
-# CRCON HTTP API (optional - do NOT include /api)
-CRCON_HTTP_BASE_URL=https://crcon.example.com:8010
-CRCON_HTTP_BEARER_TOKEN=
-CRCON_HTTP_USERNAME=vipbot
-CRCON_HTTP_PASSWORD=supersecret
-CRCON_HTTP_VERIFY=true
-CRCON_HTTP_TIMEOUT=20
+  CRCON_DATABASE_URL: "postgresql://rcon:password@host:5432/rcon",
+  DATABASE_PATH: "/data/vip-data.json",
+  DATABASE_TABLE: "vip_players",
 
-# RCON
-RCON_HOST=203.0.113.10
-RCON_PORT=21115
-RCON_PASSWORD=your-rcon-password
-RCON_VERSION=2
+  MODERATION_CHANNEL_ID: null,
+  MODERATOR_ROLE_ID: null,
+  ANNOUNCEMENT_MESSAGE_ID: null
+}
 ```
 
 ## Bot Experience
 
-1. **Register** - clicking **Register** prompts the user for their T17/Steam ID. The bot stores the mapping in JSON, prevents duplicates, and acknowledges success.
+1. **Register** - clicking **Register** reminds the user to run the `/register_player` slash command. The command features autocomplete: start typing a player name and it filters live from the CRCON database; pick the correct entry (or the “Use T17 ID …” option) and the bot links your Discord ID. A manual “Enter ID” button is available for edge cases.
 2. **Get VIP** - clicking **Get VIP** looks up the user's Discord ID. If a T17 ID is linked, the bot grants VIP via CRCON/RCON and reports the expiry. If not, it reminds the user to register first.
 
 Admins can refresh the message at any time with `/repost_frontline_controls`.

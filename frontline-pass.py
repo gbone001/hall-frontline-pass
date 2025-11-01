@@ -5,6 +5,7 @@ import base64
 import binascii
 import contextlib
 import json
+import json5
 import logging
 import os
 import socket
@@ -16,7 +17,8 @@ import requests
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple, Union
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import discord
 import pytz
@@ -219,16 +221,6 @@ def _resolve_database_path(explicit_path: Optional[str]) -> str:
     return "vip-data.json"
 
 
-def _optional_int(name: str) -> Optional[int]:
-    value = os.getenv(name)
-    if not value:
-        return None
-    try:
-        return int(value)
-    except ValueError as exc:
-        raise RuntimeError(f"Invalid integer for {name}: {value}") from exc
-
-
 def _parse_bool_env(name: str, raw: Optional[str], errors: List[str]) -> Optional[bool]:
     if raw is None:
         return None
@@ -241,6 +233,34 @@ def _parse_bool_env(name: str, raw: Optional[str], errors: List[str]) -> Optiona
         return False
     errors.append(f"{name} must be a boolean (true/false); got {raw!r}")
     return None
+
+
+def _load_raw_config() -> Tuple[Dict[str, Any], Optional[Path]]:
+    candidate_paths: List[Path] = []
+    env_path = os.getenv("FRONTLINE_CONFIG_PATH") or os.getenv("CRCON_CONFIG_PATH")
+    if env_path:
+        candidate_paths.append(Path(env_path))
+    base_dir = Path(__file__).resolve().parent
+    for name in ("config.jsonc", "config.json"):
+        candidate_paths.append(base_dir / name)
+        candidate_paths.append(Path.cwd() / name)
+
+    for path in candidate_paths:
+        if not path:
+            continue
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                data = json5.load(handle)
+        except FileNotFoundError:
+            continue
+        except Exception:
+            logging.exception("Failed to load configuration from %s", path)
+            continue
+        if isinstance(data, dict):
+            logging.info("Loaded configuration from %s", path)
+            return data, path
+    logging.warning("No configuration file found; relying on environment variables.")
+    return {}, None
 
 
 @dataclass(frozen=True)
@@ -279,40 +299,112 @@ class AppConfig:
 
 def load_config() -> AppConfig:
     load_dotenv()
-    errors = []
+    raw_config, config_path = _load_raw_config()
+    config_values = {str(key).upper(): value for key, value in raw_config.items()}
+    errors: List[str] = []
 
-    def require(name: str) -> str:
-        value = os.getenv(name)
-        if value is None or not value.strip():
+    config_aliases: Dict[str, Tuple[str, ...]] = {
+        "CRCON_HTTP_BASE_URL": ("API_BASE_URL",),
+        "CRCON_HTTP_BEARER_TOKEN": ("API_BEARER_TOKEN",),
+        "CRCON_HTTP_USERNAME": ("API_USERNAME",),
+        "CRCON_HTTP_PASSWORD": ("API_PASSWORD",),
+        "CRCON_HTTP_VERIFY": ("API_VERIFY",),
+        "CRCON_HTTP_TIMEOUT": ("API_TIMEOUT",),
+        "CRCON_DATABASE_URL": ("DB_URL", "DATABASE_URL"),
+        "DATABASE_PATH": ("JSON_DATABASE_PATH",),
+        "DATABASE_TABLE": ("JSON_DATABASE_TABLE",),
+    }
+
+    def config_lookup(name: str) -> Any:
+        upper = name.upper()
+        if upper in config_values and config_values[upper] not in (None, ""):
+            return config_values[upper]
+        for alias in config_aliases.get(upper, ()): 
+            alias_upper = alias.upper()
+            if alias_upper in config_values and config_values[alias_upper] not in (None, ""):
+                return config_values[alias_upper]
+        return None
+
+    def get_value(name: str, default: Any = None) -> Any:
+        env_value = os.getenv(name)
+        if env_value is not None and env_value.strip() != "":
+            return env_value.strip()
+        lookup = config_lookup(name)
+        if lookup is not None:
+            return lookup
+        return default
+
+    def require_str(name: str) -> str:
+        value = get_value(name)
+        if value is None or str(value).strip() == "":
             errors.append(f"{name} is required")
             return ""
-        return value.strip()
+        return str(value).strip()
 
-    discord_token = require("DISCORD_TOKEN")
-    vip_duration_raw = require("VIP_DURATION_HOURS")
-    channel_id_raw = require("CHANNEL_ID")
-    timezone_name = require("LOCAL_TIMEZONE")
-    rcon_host = require("RCON_HOST")
-    rcon_port_raw = require("RCON_PORT")
-    rcon_password = require("RCON_PASSWORD")
-    rcon_version_raw = os.getenv("RCON_VERSION", "2").strip()
+    def require_float(name: str) -> Optional[float]:
+        value = get_value(name)
+        if value is None or str(value).strip() == "":
+            errors.append(f"{name} is required")
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            errors.append(f"{name} must be a number (got {value!r})")
+            return None
 
-    vip_duration_hours = None
-    channel_id = None
-    rcon_port = None
-    rcon_version = None
+    def require_int(name: str) -> Optional[int]:
+        value = get_value(name)
+        if value is None or str(value).strip() == "":
+            errors.append(f"{name} is required")
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            errors.append(f"{name} must be an integer (got {value!r})")
+            return None
 
-    try:
-        vip_duration_hours = float(vip_duration_raw)
-        if vip_duration_hours <= 0:
-            errors.append("VIP_DURATION_HOURS must be greater than zero")
-    except ValueError:
-        errors.append(f"VIP_DURATION_HOURS must be a number (got {vip_duration_raw!r})")
+    def optional_int(name: str) -> Optional[int]:
+        value = get_value(name)
+        if value is None or str(value).strip() == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            errors.append(f"{name} must be an integer (got {value!r})")
+            return None
 
-    try:
-        channel_id = int(channel_id_raw)
-    except ValueError:
-        errors.append(f"CHANNEL_ID must be an integer (got {channel_id_raw!r})")
+    def optional_float(name: str, default: Optional[float] = None) -> Optional[float]:
+        value = get_value(name)
+        if value is None or str(value).strip() == "":
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            errors.append(f"{name} must be a number (got {value!r})")
+            return default
+
+    def optional_bool(name: str, default: Optional[bool] = None) -> Optional[bool]:
+        value = get_value(name)
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        parsed = _parse_bool_env(name, str(value), errors)
+        if parsed is not None:
+            return parsed
+        return default
+
+    discord_token = require_str("DISCORD_TOKEN")
+    vip_duration_hours = require_float("VIP_DURATION_HOURS")
+    channel_id = require_int("CHANNEL_ID")
+    timezone_name = require_str("LOCAL_TIMEZONE")
+    rcon_host = require_str("RCON_HOST")
+    rcon_port = require_int("RCON_PORT")
+    rcon_password = require_str("RCON_PASSWORD")
+    rcon_version = optional_int("RCON_VERSION") or 2
+
+    if vip_duration_hours is not None and vip_duration_hours <= 0:
+        errors.append("VIP_DURATION_HOURS must be greater than zero")
 
     try:
         timezone = pytz.timezone(timezone_name)
@@ -320,63 +412,32 @@ def load_config() -> AppConfig:
         errors.append(f"LOCAL_TIMEZONE must be a valid IANA timezone (got {timezone_name!r})")
         timezone = pytz.UTC
 
-    try:
-        rcon_port = int(rcon_port_raw)
-    except ValueError:
-        errors.append(f"RCON_PORT must be an integer (got {rcon_port_raw!r})")
+    database_path_value = get_value("DATABASE_PATH")
+    database_path = _resolve_database_path(str(database_path_value) if database_path_value else None)
 
-    try:
-        rcon_version = int(rcon_version_raw)
-    except ValueError:
-        errors.append(f"RCON_VERSION must be an integer (got {rcon_version_raw!r})")
-
-    database_table = (os.getenv("DATABASE_TABLE") or "vip_players").strip()
-    if not database_table:
+    database_table_value = get_value("DATABASE_TABLE", default="vip_players")
+    if not database_table_value or not str(database_table_value).strip():
         errors.append("DATABASE_TABLE must not be empty")
+    database_table = str(database_table_value).strip() if database_table_value else "vip_players"
 
-    database_path = _resolve_database_path(os.getenv("DATABASE_PATH"))
-    moderation_channel_id = _optional_int("MODERATION_CHANNEL_ID")
-    moderator_role_id = _optional_int("MODERATOR_ROLE_ID")
-    announcement_message_id = _optional_int("ANNOUNCEMENT_MESSAGE_ID")
+    moderation_channel_id = optional_int("MODERATION_CHANNEL_ID")
+    moderator_role_id = optional_int("MODERATOR_ROLE_ID")
+    announcement_message_id = optional_int("ANNOUNCEMENT_MESSAGE_ID")
 
-    http_base_url = os.getenv("CRCON_HTTP_BASE_URL")
-    http_bearer_token = os.getenv("CRCON_HTTP_BEARER_TOKEN")
-    http_username = os.getenv("CRCON_HTTP_USERNAME")
-    http_password = os.getenv("CRCON_HTTP_PASSWORD")
-    http_verify_raw = os.getenv("CRCON_HTTP_VERIFY", "true")
-    http_timeout_raw = os.getenv("CRCON_HTTP_TIMEOUT", "20")
+    http_base_url_raw = get_value("CRCON_HTTP_BASE_URL")
+    http_bearer_token = get_value("CRCON_HTTP_BEARER_TOKEN")
+    http_username = get_value("CRCON_HTTP_USERNAME")
+    http_password = get_value("CRCON_HTTP_PASSWORD")
+    http_verify = optional_bool("CRCON_HTTP_VERIFY", default=True)
+    http_timeout = optional_float("CRCON_HTTP_TIMEOUT", default=20.0) or 20.0
+
     http_credentials: Optional[HttpCredentials] = None
-    crcon_database_url = (os.getenv("CRCON_DATABASE_URL") or "").strip() or None
+    trimmed_base = str(http_base_url_raw).strip() if http_base_url_raw else ""
+    trimmed_token = str(http_bearer_token).strip() if http_bearer_token else ""
+    trimmed_username = str(http_username).strip() if http_username else ""
+    password_provided = bool(http_password and str(http_password).strip())
 
-    trimmed_base = (http_base_url or "").strip()
-    trimmed_token = (http_bearer_token or "").strip()
-    trimmed_username = (http_username or "").strip()
-    password_provided = bool(http_password and http_password.strip())
-    http_verify = True
-    parsed_verify = _parse_bool_env("CRCON_HTTP_VERIFY", http_verify_raw, errors)
-    if parsed_verify is not None:
-        http_verify = parsed_verify
-
-    http_timeout = 20.0
-    if http_timeout_raw is not None:
-        timeout_value = http_timeout_raw.strip()
-        if timeout_value:
-            try:
-                http_timeout = float(timeout_value)
-                if http_timeout <= 0:
-                    errors.append("CRCON_HTTP_TIMEOUT must be greater than zero")
-            except ValueError:
-                errors.append(f"CRCON_HTTP_TIMEOUT must be a number (got {http_timeout_raw!r})")
-
-    if any(
-        value
-        for value in (
-            trimmed_base,
-            trimmed_token,
-            trimmed_username,
-            http_password if http_password else None,
-        )
-    ):
+    if any((trimmed_base, trimmed_token, trimmed_username, http_password)):
         normalized_base = trimmed_base.rstrip("/")
         if not normalized_base:
             errors.append("CRCON_HTTP_BASE_URL is required when using the HTTP API integration")
@@ -400,15 +461,17 @@ def load_config() -> AppConfig:
                 base_url=normalized_base,
                 bearer_token=trimmed_token or None,
                 username=trimmed_username or None,
-                password=http_password if password_provided else None,
-                verify=http_verify,
+                password=str(http_password).strip() if password_provided else None,
+                verify=http_verify if http_verify is not None else True,
                 timeout=http_timeout,
             )
+
+    crcon_database_url_raw = get_value("CRCON_DATABASE_URL")
+    crcon_database_url = str(crcon_database_url_raw).strip() if crcon_database_url_raw else None
 
     if errors:
         raise RuntimeError("Configuration error(s): " + "; ".join(errors))
 
-    # Type narrowing for static checkers
     assert vip_duration_hours is not None
     assert channel_id is not None
     assert rcon_port is not None
@@ -703,6 +766,7 @@ class Database:
 
     def set_metadata(self, key: str, value: str) -> None:
         if self._using_sqlite():
+            rows: List[Tuple[Any, ...]] = []
             with self._lock:
                 connection = self._sqlite_connection()
                 try:
@@ -770,6 +834,58 @@ class Database:
                     connection.close()
         with self._lock:
             return len(self._players())
+
+    def search_registered_players(self, prefix: str, *, limit: int = 20) -> List[Tuple[str, Optional[str]]]:
+        if not prefix:
+            return []
+        limit = max(1, min(limit, 100))
+        prefix_lower = prefix.lower()
+
+        results: List[Tuple[str, Optional[str]]] = []
+        if self._using_sqlite():
+            with self._lock:
+                connection = self._sqlite_connection()
+                try:
+                    cursor = connection.cursor()
+                    try:
+                        cursor.execute(
+                            f'''
+                            SELECT p.steam_id, m.value
+                            FROM "{self.table}" p
+                            LEFT JOIN metadata m ON m.key = 'player_name:' || p.discord_id
+                            WHERE LOWER(COALESCE(m.value, p.steam_id)) LIKE ?
+                            LIMIT ?
+                            ''',
+                            (f"%{prefix_lower}%", limit),
+                        )
+                        rows = cursor.fetchall()
+                    finally:
+                        cursor.close()
+                finally:
+                    connection.close()
+            for row in rows:
+                if not row:
+                    continue
+                steam_id = row[0]
+                name = row[1] if len(row) > 1 else None
+                if isinstance(steam_id, str) and steam_id:
+                    results.append((steam_id, name if isinstance(name, str) else None))
+            return results
+
+        with self._lock:
+            players = list(self._players().items())
+            metadata = self._data.get("metadata", {}) if isinstance(self._data, dict) else {}
+
+        for discord_id, steam_id in players:
+            if not isinstance(steam_id, str) or not steam_id:
+                continue
+            name = metadata.get(f"player_name:{discord_id}") if isinstance(metadata, dict) else None
+            candidate = name if isinstance(name, str) and name else steam_id
+            if prefix_lower in candidate.lower():
+                results.append((steam_id, name if isinstance(name, str) and name else None))
+                if len(results) >= limit:
+                    break
+        return results
 
 
 class RconError(Exception):
@@ -1018,6 +1134,36 @@ class VipService:
         ) as client:
             return client.add_vip(player_id, comment)
 
+    def search_players(self, prefix: str, *, limit: int = 20) -> List[Tuple[str, str]]:
+        if not prefix:
+            return []
+        results: List[Tuple[str, str]] = []
+        if self._player_directory:
+            try:
+                results.extend(self._player_directory.search_players(prefix, limit=limit))
+            except Exception:
+                logging.exception("PlayerDirectory search failed for prefix %s", prefix)
+
+        if self._http_client:
+            try:
+                http_results = self._http_client.search_players(prefix, limit=limit)
+                results.extend(http_results)
+            except VipHTTPError:
+                logging.exception("HTTP search failed for prefix %s", prefix)
+
+        # Deduplicate while preserving order
+        seen: Set[str] = set()
+        deduped: List[Tuple[str, str]] = []
+        for player_id, name in results:
+            key = f"{player_id}:{name}"
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append((player_id, name))
+            if len(deduped) >= limit:
+                break
+        return deduped
+
 
 class ModeratorNotifier:
     def __init__(self, config: AppConfig) -> None:
@@ -1077,6 +1223,18 @@ class PlayerDirectory:
             LIMIT 1
             """
         )
+        self._search_query = text(
+            """
+            SELECT DISTINCT ON (pn.playersteamid_id)
+                pn.playersteamid_id,
+                pn.name
+            FROM player_names pn
+            WHERE pn.name ILIKE :search
+               OR (:exact_id IS NOT NULL AND pn.playersteamid_id = :exact_id)
+            ORDER BY pn.playersteamid_id, pn.last_seen DESC
+            LIMIT :limit
+            """
+        )
 
     def lookup_player_name(self, steam_id: str) -> Optional[str]:
         if not steam_id:
@@ -1104,6 +1262,37 @@ class PlayerDirectory:
         with self._lock:
             self._cache[steam_id] = (now, name)
         return name
+
+    def search_players(self, prefix: str, *, limit: int = 20) -> List[Tuple[str, str]]:
+        if not prefix:
+            return []
+        limit = max(1, min(limit, 25))
+        try:
+            with self._engine.connect() as connection:
+                rows = connection.execute(
+                    self._search_query,
+                    {
+                        "search": f"{prefix}%",
+                        "exact_id": prefix if prefix.isdigit() else None,
+                        "limit": limit,
+                    },
+                ).fetchall()
+        except SQLAlchemyError:
+            logging.exception("Failed to search player names for prefix %s", prefix)
+            return []
+
+        results: List[Tuple[str, str]] = []
+        for row in rows:
+            if len(row) < 2:
+                continue
+            steam_id_raw, name_raw = row[0], row[1]
+            if steam_id_raw is None or name_raw is None:
+                continue
+            steam_id = str(steam_id_raw).strip()
+            player_name = str(name_raw).strip()
+            if steam_id and player_name:
+                results.append((steam_id, player_name))
+        return results
 
 
 class VipHttpClient:
@@ -1212,17 +1401,20 @@ class VipHttpClient:
         endpoint: str,
         *,
         json_payload: Optional[Dict[str, Any]] = None,
+        query_params: Optional[Dict[str, Any]] = None,
     ) -> requests.Response:
         url = self._endpoint(endpoint)
         self._ensure_authenticated()
         headers = self._headers()
-        response = self.session.request(
-            method,
-            url,
-            headers=headers,
-            json=json_payload,
-            timeout=self.timeout,
-        )
+        request_kwargs: Dict[str, Any] = {
+            "headers": headers,
+            "timeout": self.timeout,
+        }
+        if json_payload is not None:
+            request_kwargs["json"] = json_payload
+        if query_params is not None:
+            request_kwargs["params"] = query_params
+        response = self.session.request(method, url, **request_kwargs)
         if response.status_code == 401:
             if self.credentials.bearer_token:
                 self._bearer_failed = True
@@ -1234,13 +1426,15 @@ class VipHttpClient:
             )
             if self._refresh_token_if_possible():
                 headers = self._headers()
-                response = self.session.request(
-                    method,
-                    url,
-                    headers=headers,
-                    json=json_payload,
-                    timeout=self.timeout,
-                )
+                request_kwargs = {
+                    "headers": headers,
+                    "timeout": self.timeout,
+                }
+                if json_payload is not None:
+                    request_kwargs["json"] = json_payload
+                if query_params is not None:
+                    request_kwargs["params"] = query_params
+                response = self.session.request(method, url, **request_kwargs)
         return response
 
     @staticmethod
@@ -1294,6 +1488,27 @@ class VipHttpClient:
             raise VipHTTPError(f"add_vip reported failure: {data.get('error') or data}")
         return data
 
+    def search_players(self, prefix: str, *, limit: int = 20) -> List[Tuple[str, str]]:
+        if not prefix:
+            return []
+        params = {"search": prefix, "page": 1, "per_page": max(1, min(limit, 100))}
+        try:
+            response = self._request_with_reauth("GET", "get_players", query_params=params)
+        except requests.exceptions.RequestException as exc:
+            raise VipHTTPError(f"HTTP API request failed: {exc}") from exc
+
+        if response.status_code != 200:
+            raise VipHTTPError(f"get_players failed with status {response.status_code}: {response.text}")
+
+        data = self._parse_json(response)
+        results = []
+        for entry in data.get("result", []):
+            player_id = entry.get("player_id")
+            name = entry.get("name")
+            if isinstance(player_id, str) and player_id and isinstance(name, str) and name:
+                results.append((player_id, name))
+        return results
+
     @staticmethod
     def _parse_json(response: requests.Response) -> Dict[str, Any]:
         try:
@@ -1311,6 +1526,72 @@ class VipGrantResult:
     detail: str
 
 
+class ManualEntryPromptView(View):
+    def __init__(self, parent_view: "CombinedView") -> None:
+        super().__init__(timeout=60)
+        self.parent_view = parent_view
+        self.add_item(ManualEntryPromptButton(parent_view))
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            with contextlib.suppress(Exception):
+                item.disabled = True
+
+
+class ManualEntryPromptButton(Button):
+    def __init__(self, parent_view: "CombinedView") -> None:
+        super().__init__(
+            label="Enter ID manually",
+            style=ButtonStyle.secondary,
+            custom_id="frontline-pass-manual-entry",
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(PlayerIDModal(self.parent_view))
+
+
+class PlayerSelectionView(View):
+    def __init__(self, parent_view: "CombinedView", options: List[Tuple[str, str]]) -> None:
+        super().__init__(timeout=60)
+        self.parent_view = parent_view
+        self._lookup: Dict[str, str] = {}
+        select_options = []
+        for player_id, name in options:
+            sanitized_id = player_id.strip()
+            if not sanitized_id:
+                continue
+            display_name = name[:100] if name else sanitized_id
+            select_options.append(
+                discord.SelectOption(
+                    label=display_name,
+                    value=sanitized_id,
+                )
+            )
+            self._lookup[sanitized_id] = display_name
+        self._select = discord.ui.Select(
+            placeholder="Select a player",
+            options=select_options,
+            min_values=1,
+            max_values=1,
+        )
+        self._select.callback = self._on_select
+        self.add_item(self._select)
+        self.add_item(ManualEntryPromptButton(parent_view))
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        value = self._select.values[0]
+        display_name = self._lookup.get(value, value)
+        await self.parent_view.complete_registration(
+            interaction,
+            value,
+            player_name=display_name,
+        )
+        with contextlib.suppress(discord.HTTPException):
+            if interaction.message:
+                await interaction.message.edit(content="Registration complete.", view=None)
+        self.stop()
+
 class PlayerIDModal(Modal):
     def __init__(self, parent_view: "CombinedView"):
         super().__init__(title="Please input Player-ID", custom_id="frontline-pass-player-id-modal")
@@ -1325,36 +1606,12 @@ class PlayerIDModal(Modal):
         self.add_item(self.player_id)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        steam_id = self.player_id.value.strip()
-        if not steam_id:
-            await interaction.response.send_message("T17 ID cannot be empty.", ephemeral=True)
-            schedule_ephemeral_cleanup(interaction)
-            return
-
-        discord_id = str(interaction.user.id)
-        previous_steam_id = self.database.fetch_player(discord_id)
-        player_name = self._parent_view.bot.lookup_player_name(steam_id)
-
-        try:
-            self.database.upsert_player(discord_id, steam_id, player_name=player_name)
-        except DuplicateSteamIDError as exc:
-            await interaction.response.send_message(
-                "Error: That T17 ID is already linked to another Discord account. A moderator has been notified.",
-                ephemeral=True,
-            )
-            schedule_ephemeral_cleanup(interaction)
-            await self.notifier.notify_duplicate(interaction, exc.steam_id, exc.existing_discord_id)
-            return
-
-        display_id = f"{steam_id} ({player_name})" if player_name else steam_id
-        if previous_steam_id and previous_steam_id != steam_id:
-            message = f"Your T17 ID was updated to {display_id}."
-        else:
-            message = f"Your T17 ID {display_id} has been saved!"
-
-        await interaction.response.send_message(message, ephemeral=True)
-        schedule_ephemeral_cleanup(interaction)
-        await self._parent_view.bot.refresh_announcement_message()
+        steam_id = self.player_id.value
+        await self._parent_view.complete_registration(
+            interaction,
+            steam_id,
+            player_name=self._parent_view.bot.lookup_player_name(steam_id.strip()),
+        )
 
 
 class PersistentView(View):
@@ -1390,6 +1647,19 @@ class CombinedView(PersistentView):
                 f"You're already registered. Your T17 ID `{display}` is linked to your Discord account.",
                 ephemeral=True,
             )
+            schedule_ephemeral_cleanup(interaction)
+            return
+
+        if self.bot.player_directory:
+            command = interaction.client.tree.get_command("register_player") if hasattr(interaction.client, "tree") else None
+            command_mention = command.mention if command else "/register_player"
+            view = ManualEntryPromptView(self)
+            message = (
+                f"Use {command_mention} and start typing to search for your player. "
+                "Select the correct entry to link your Discord account.\n"
+                "Can't find it? Click the button below to enter your T17 ID manually."
+            )
+            await interaction.response.send_message(message, view=view, ephemeral=True)
             schedule_ephemeral_cleanup(interaction)
             return
 
@@ -1475,6 +1745,70 @@ class CombinedView(PersistentView):
     def refresh_vip_label(self) -> None:
         self._refresh_button_label()
 
+    async def complete_registration(
+        self,
+        interaction: discord.Interaction,
+        steam_id: str,
+        *,
+        player_name: Optional[str] = None,
+    ) -> None:
+        steam_id = steam_id.strip()
+        if not steam_id:
+            if interaction.response.is_done():
+                followup_message = await interaction.followup.send(
+                    "T17 ID cannot be empty.",
+                    ephemeral=True,
+                    wait=True,
+                )
+                schedule_ephemeral_cleanup(interaction, message=followup_message)
+            else:
+                await interaction.response.send_message("T17 ID cannot be empty.", ephemeral=True)
+                schedule_ephemeral_cleanup(interaction)
+            return
+
+        discord_id = str(interaction.user.id)
+        previous_steam_id = self.database.fetch_player(discord_id)
+        resolved_name = player_name or self.bot.lookup_player_name(steam_id)
+
+        try:
+            self.database.upsert_player(discord_id, steam_id, player_name=resolved_name)
+        except DuplicateSteamIDError as exc:
+            duplicate_message = (
+                "Error: That T17 ID is already linked to another Discord account. "
+                "A moderator has been notified."
+            )
+            if interaction.response.is_done():
+                followup_message = await interaction.followup.send(
+                    duplicate_message,
+                    ephemeral=True,
+                    wait=True,
+                )
+                schedule_ephemeral_cleanup(interaction, message=followup_message)
+            else:
+                await interaction.response.send_message(duplicate_message, ephemeral=True)
+                schedule_ephemeral_cleanup(interaction)
+            await self.notifier.notify_duplicate(interaction, exc.steam_id, exc.existing_discord_id)
+            return
+
+        display_id = f"{steam_id} ({resolved_name})" if resolved_name else steam_id
+        if previous_steam_id and previous_steam_id != steam_id:
+            success_message = f"Your T17 ID was updated to {display_id}."
+        else:
+            success_message = f"Your T17 ID {display_id} has been saved!"
+
+        if interaction.response.is_done():
+            followup_message = await interaction.followup.send(
+                success_message,
+                ephemeral=True,
+                wait=True,
+            )
+            schedule_ephemeral_cleanup(interaction, message=followup_message)
+        else:
+            await interaction.response.send_message(success_message, ephemeral=True)
+            schedule_ephemeral_cleanup(interaction)
+
+        await self.bot.refresh_announcement_message()
+
 
 def create_database(config: AppConfig) -> Database:
     return Database(config.database_path, config.database_table)
@@ -1503,11 +1837,63 @@ class FrontlinePassBot(commands.Bot):
         self.persistent_view: Optional[CombinedView] = None
         self.announcement_manager = AnnouncementManager(config, database)
         self._vip_duration_hours = self._load_vip_duration()
+        self._autocomplete_cache: Dict[str, str] = {}
 
     def lookup_player_name(self, steam_id: str) -> Optional[str]:
+        if steam_id in self._autocomplete_cache:
+            return self._autocomplete_cache.get(steam_id)
         if self.player_directory:
-            return self.player_directory.lookup_player_name(steam_id)
-        return None
+            name = self.player_directory.lookup_player_name(steam_id)
+            if name:
+                self._autocomplete_cache[steam_id] = name
+            return name
+        return self._autocomplete_cache.get(steam_id)
+
+    def search_player_directory(self, prefix: str, *, limit: int = 20) -> List[Tuple[str, str]]:
+        if not self.player_directory:
+            return []
+        return self.player_directory.search_players(prefix, limit=limit)
+
+    def find_player_candidates(self, prefix: str, *, limit: int = 20) -> List[Tuple[str, str]]:
+        combined: List[Tuple[str, str]] = []
+        remaining = limit
+        if self.player_directory and remaining > 0:
+            try:
+                results = self.player_directory.search_players(prefix, limit=remaining)
+                combined.extend(results)
+                remaining = max(0, limit - len(combined))
+            except Exception:
+                logging.exception("PlayerDirectory search failed for prefix %s", prefix)
+
+        if remaining > 0:
+            registered = self.database.search_registered_players(prefix, limit=remaining)
+            for steam_id, name in registered:
+                if not isinstance(steam_id, str) or not steam_id:
+                    continue
+                combined.append((steam_id, name or steam_id))
+                remaining = max(0, limit - len(combined))
+                if remaining <= 0:
+                    break
+
+        if remaining > 0:
+            try:
+                http_results = self.vip_service.search_players(prefix, limit=remaining)
+                combined.extend(http_results)
+            except Exception:
+                logging.exception("HTTP search failed for prefix %s", prefix)
+
+        deduped: List[Tuple[str, str]] = []
+        seen: Set[str] = set()
+        for player_id, name in combined:
+            key = f"{player_id}:{name}"
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append((player_id, name))
+            self._autocomplete_cache[player_id] = name
+            if len(deduped) >= limit:
+                break
+        return deduped
 
     async def setup_hook(self) -> None:
         self.persistent_view = CombinedView(self, self.config, self.database, self.vip_service, self.notifier)
@@ -1598,6 +1984,59 @@ class FrontlinePassBot(commands.Bot):
         await self.refresh_announcement_message()
 
     async def _register_commands(self) -> None:
+        @self.tree.command(
+            name="register_player",
+            description="Search for your player name and link your T17 ID.",
+        )
+        @app_commands.describe(player="Start typing a player name or T17 ID")
+        async def register_player(interaction: discord.Interaction, player: str) -> None:
+            if not self.persistent_view:
+                await interaction.response.send_message(
+                    "The registration system is not ready yet. Please try again shortly.",
+                    ephemeral=True,
+                )
+                schedule_ephemeral_cleanup(interaction)
+                return
+
+            await interaction.response.defer(ephemeral=True)
+
+            trimmed = player.strip()
+            if not trimmed:
+                followup = await interaction.followup.send(
+                    "Search text cannot be empty.",
+                    ephemeral=True,
+                    wait=True,
+                )
+                schedule_ephemeral_cleanup(interaction, message=followup)
+                return
+
+            candidates = await asyncio.to_thread(
+                self.find_player_candidates,
+                trimmed,
+                limit=25,
+            )
+
+            parent_view = self.persistent_view
+            if not candidates:
+                view = ManualEntryPromptView(parent_view) if parent_view else None
+                followup = await interaction.followup.send(
+                    "No matching players found. Use the button below to enter your T17 ID manually.",
+                    view=view,
+                    ephemeral=True,
+                    wait=True,
+                )
+                schedule_ephemeral_cleanup(interaction, message=followup)
+                return
+
+            selection_view = PlayerSelectionView(parent_view, candidates) if parent_view else None
+            followup = await interaction.followup.send(
+                "Select your player from the list below (or choose manual entry).",
+                view=selection_view,
+                ephemeral=True,
+                wait=True,
+            )
+            schedule_ephemeral_cleanup(interaction, message=followup)
+
         @self.tree.command(
             name="repost_frontline_controls",
             description="Repost the Frontline VIP control panel.",
@@ -1754,4 +2193,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
