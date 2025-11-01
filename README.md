@@ -30,6 +30,27 @@ python frontline-pass.py
 
 On first launch the bot posts the control panel in your target channel and creates `vip-data.json` (or the path specified by `DATABASE_PATH`).
 
+## Persistent systemd service
+
+The repo ships with a systemd template and helper script so the bot restarts automatically after crashes or reboots.
+
+1. Create the virtual environment and install dependencies (`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`).
+2. Adjust `.env` for your deployment (the service loads it from `/opt/hall-frontline-pass/.env` by default). If you cloned the repo elsewhere, edit `hall-frontline-pass.service.dist` or set `PROJECT_ROOT` related paths before installing.
+3. Install the unit and enable it at boot:
+   ```bash
+   ./manage_frontline_pass.sh install        # copies hall-frontline-pass.service.dist -> /etc/systemd/system/hall-frontline-pass@.service
+   ```
+   By default the script enables `hall-frontline-pass@$(whoami).service`. Override `BOT_SERVICE_USER` if you run under a different account.
+4. Control the bot with the helper script (wraps `systemctl`):
+   ```bash
+   ./manage_frontline_pass.sh start
+   ./manage_frontline_pass.sh status
+   ./manage_frontline_pass.sh restart
+   ```
+   Use `stop` to take it offline, or `run` to execute the bot in the foreground for development (`./manage_frontline_pass.sh run`).
+
+The systemd unit uses `Restart=on-failure`, so systemd automatically relaunches the bot if it exits unexpectedly. `WantedBy=multi-user.target` ensures it starts on every boot.
+
 ## Configuration Cheat Sheet
 
 | Variable | Required | Purpose |

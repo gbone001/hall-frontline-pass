@@ -1,12 +1,19 @@
 [Unit]
-Description=frontline-pass - klick on Discord-button to get temporaraly VIP on the gameserver
+Description=Frontline Pass Discord bot
 After=network.target
+StartLimitIntervalSec=0
 
 [Service]
-User=<your-username>
-WorkingDirectory=/home/hackletloose/bots/hall-frontline-pass
-ExecStart=/usr/bin/python3 /home/hackletloose/bots/hall-frontline-pass/frontline-pass.py
-Restart=always
+Type=simple
+# Install as hall-frontline-pass@<username>.service so the template picks up the account.
+User=%i
+Group=%i
+WorkingDirectory=/opt/hall-frontline-pass
+EnvironmentFile=/opt/hall-frontline-pass/.env
+ExecStart=/opt/hall-frontline-pass/.venv/bin/python frontline-pass.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target

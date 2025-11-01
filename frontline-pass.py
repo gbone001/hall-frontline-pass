@@ -1077,17 +1077,6 @@ class PlayerDirectory:
             LIMIT 1
             """
         )
-        self._search_query = text(
-            """
-            SELECT DISTINCT ON (pn.playersteamid_id)
-                pn.playersteamid_id,
-                pn.name
-            FROM player_names pn
-            WHERE pn.name ILIKE :search
-            ORDER BY pn.playersteamid_id, pn.last_seen DESC
-            LIMIT :limit
-            """
-        )
 
     def lookup_player_name(self, steam_id: str) -> Optional[str]:
         if not steam_id:
@@ -1115,33 +1104,6 @@ class PlayerDirectory:
         with self._lock:
             self._cache[steam_id] = (now, name)
         return name
-
-    def search_players(self, prefix: str, *, limit: int = 20) -> List[Tuple[str, str]]:
-        if not prefix:
-            return []
-        limit = max(1, min(limit, 100))
-        try:
-            with self._engine.connect() as connection:
-                rows = connection.execute(
-                    self._search_query,
-                    {"search": f"{prefix}%", "limit": limit},
-                ).fetchall()
-        except SQLAlchemyError:
-            logging.exception("Failed to search player names for prefix %s", prefix)
-            return []
-
-        results: List[Tuple[str, str]] = []
-        for row in rows:
-            if len(row) < 2:
-                continue
-            steam_id_raw, name_raw = row[0], row[1]
-            if steam_id_raw is None or name_raw is None:
-                continue
-            steam_id = str(steam_id_raw).strip()
-            player_name = str(name_raw).strip()
-            if steam_id and player_name:
-                results.append((steam_id, player_name))
-        return results
 
 
 class VipHttpClient:
@@ -1175,12 +1137,16 @@ class VipHttpClient:
             "Content-Type": "application/json",
             "Connection": "keep-alive",
         }
+        token: Optional[str] = None
         if include_auth:
             token = self._authorization_token()
             if token:
                 headers["Authorization"] = f"Bearer {token}"
-            else:
-                headers.setdefault("Referer", self.credentials.base_url)
+        if include_auth and not token:
+            headers["Referer"] = self.credentials.base_url
+            csrf_token = self.session.cookies.get("csrftoken")
+            if csrf_token:
+                headers["X-CSRFToken"] = csrf_token
         return headers
 
     def _authorization_token(self) -> Optional[str]:
@@ -1222,9 +1188,11 @@ class VipHttpClient:
         if data.get("failed"):
             raise VipHTTPError(f"Login failed: {data.get('error') or data}")
 
-        # Session-based auth relies on cookies (csrftoken/sessionid)
-        if not self.session.cookies.get("sessionid"):
-            raise VipHTTPError("Login succeeded but no session cookie was provided.")
+        token = self._extract_token(data)
+        self._token = token
+        has_session_cookie = bool(self.session.cookies.get("sessionid"))
+        if not has_session_cookie and not token:
+            raise VipHTTPError("Login succeeded but no session cookie or auth token was provided.")
         self._authenticated = True
 
     def _refresh_token_if_possible(self) -> bool:
@@ -1786,7 +1754,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
 
