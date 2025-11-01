@@ -28,6 +28,9 @@ except ImportError:  # discord.py>=2.4 renamed MessageableChannel -> Messageable
 from discord.ext import commands
 from discord.ui import Button, Modal, TextInput, View
 from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 logging.basicConfig(level=logging.INFO)
 
@@ -267,6 +270,7 @@ class AppConfig:
     moderator_role_id: Optional[int]
     announcement_message_id: Optional[int]
     http_credentials: Optional[HttpCredentials]
+    crcon_database_url: Optional[str]
 
     @property
     def vip_duration_label(self) -> str:
@@ -342,6 +346,7 @@ def load_config() -> AppConfig:
     http_verify_raw = os.getenv("CRCON_HTTP_VERIFY", "true")
     http_timeout_raw = os.getenv("CRCON_HTTP_TIMEOUT", "20")
     http_credentials: Optional[HttpCredentials] = None
+    crcon_database_url = (os.getenv("CRCON_DATABASE_URL") or "").strip() or None
 
     trimmed_base = (http_base_url or "").strip()
     trimmed_token = (http_bearer_token or "").strip()
@@ -425,6 +430,7 @@ def load_config() -> AppConfig:
         moderator_role_id=moderator_role_id,
         announcement_message_id=announcement_message_id,
         http_credentials=http_credentials,
+        crcon_database_url=crcon_database_url,
     )
 
 
@@ -601,6 +607,29 @@ class Database:
             finally:
                 connection.close()
 
+    def _sqlite_store_player_name(self, discord_id: str, player_name: str) -> None:
+        if not player_name:
+            return
+        key = f"player_name:{discord_id}"
+        with self._lock:
+            connection = self._sqlite_connection()
+            try:
+                cursor = connection.cursor()
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO metadata (key, value)
+                        VALUES (?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                        """,
+                        (key, player_name),
+                    )
+                    connection.commit()
+                finally:
+                    cursor.close()
+            finally:
+                connection.close()
+
     def _save_locked(self) -> None:
         tmp_path = f"{self._path}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as handle:
@@ -623,9 +652,11 @@ class Database:
     def _players(self) -> Dict[str, str]:
         return self._data.setdefault("players", {})
 
-    def upsert_player(self, discord_id: str, steam_id: str) -> None:
+    def upsert_player(self, discord_id: str, steam_id: str, *, player_name: Optional[str] = None) -> None:
         if self._using_sqlite():
             self._sqlite_upsert_player(discord_id, steam_id)
+            if player_name:
+                self._sqlite_store_player_name(discord_id, player_name)
             return
         with self._lock:
             players = self._players()
@@ -633,6 +664,9 @@ class Database:
                 if existing_steam == steam_id and existing_discord_id != discord_id:
                     raise DuplicateSteamIDError(steam_id, existing_discord_id)
             players[discord_id] = steam_id
+            if player_name:
+                metadata = self._data.setdefault("metadata", {})
+                metadata[f"player_name:{discord_id}"] = player_name
             self._save_locked()
 
     def fetch_player(self, discord_id: str) -> Optional[str]:
@@ -644,6 +678,17 @@ class Database:
         with self._lock:
             return self._players().get(discord_id)
 
+    def fetch_player_name(self, discord_id: str) -> Optional[str]:
+        key = f"player_name:{discord_id}"
+        if self._using_sqlite():
+            return self._sqlite_fetch_value("SELECT value FROM metadata WHERE key = ?", (key,))
+        with self._lock:
+            metadata = self._data.get("metadata", {})
+            if isinstance(metadata, dict):
+                value = metadata.get(key)
+                if value:
+                    return value
+        return None
     def fetch_discord_id_for_steam(self, steam_id: str) -> Optional[str]:
         if self._using_sqlite():
             return self._sqlite_fetch_value(
@@ -910,18 +955,34 @@ class RconClient:
 
 
 class VipService:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, player_directory: Optional[PlayerDirectory] = None) -> None:
         self._config = config
         self._http_client = VipHttpClient(config.http_credentials) if config.http_credentials else None
+        self._player_directory = player_directory
 
-    def grant_vip(self, player_id: str, comment: str, expiration_iso: Optional[str]) -> VipGrantResult:
+    def grant_vip(
+        self,
+        player_id: str,
+        comment: str,
+        expiration_iso: Optional[str],
+        *,
+        player_name: Optional[str] = None,
+    ) -> VipGrantResult:
         status_lines: List[str] = []
         detail = ""
         overall_success = False
+        resolved_player_name = player_name
+        if resolved_player_name is None and self._player_directory:
+            resolved_player_name = self._player_directory.lookup_player_name(player_id)
 
         if self._http_client:
             try:
-                response = self._http_client.add_vip(player_id, comment, expiration_iso)
+                response = self._http_client.add_vip(
+                    player_id,
+                    comment,
+                    expiration_iso,
+                    player_name=resolved_player_name,
+                )
                 message = response.get("result")
                 if isinstance(message, dict):
                     message = message.get("result") or message
@@ -998,6 +1059,89 @@ class ModeratorNotifier:
 
 class VipHTTPError(Exception):
     """Raised when the optional HTTP API integration fails."""
+
+
+class PlayerDirectory:
+    def __init__(self, database_url: str, *, cache_ttl: float = 300.0) -> None:
+        self._database_url = database_url
+        self._engine: Engine = create_engine(database_url, pool_pre_ping=True, future=True)
+        self._cache_ttl = cache_ttl
+        self._cache: Dict[str, Tuple[float, Optional[str]]] = {}
+        self._lock = threading.Lock()
+        self._latest_name_query = text(
+            """
+            SELECT name
+            FROM player_names
+            WHERE playersteamid_id = :steam_id
+            ORDER BY last_seen DESC
+            LIMIT 1
+            """
+        )
+        self._search_query = text(
+            """
+            SELECT DISTINCT ON (pn.playersteamid_id)
+                pn.playersteamid_id,
+                pn.name
+            FROM player_names pn
+            WHERE pn.name ILIKE :search
+            ORDER BY pn.playersteamid_id, pn.last_seen DESC
+            LIMIT :limit
+            """
+        )
+
+    def lookup_player_name(self, steam_id: str) -> Optional[str]:
+        if not steam_id:
+            return None
+
+        now = time.time()
+        with self._lock:
+            cached = self._cache.get(steam_id)
+            if cached and now - cached[0] <= self._cache_ttl:
+                return cached[1]
+
+        try:
+            with self._engine.connect() as connection:
+                row = connection.execute(self._latest_name_query, {"steam_id": steam_id}).first()
+                name: Optional[str]
+                if row is None:
+                    name = None
+                else:
+                    value = row[0]
+                    name = str(value).strip() if value is not None else None
+        except SQLAlchemyError:
+            logging.exception("Failed to look up player name for %s", steam_id)
+            name = None
+
+        with self._lock:
+            self._cache[steam_id] = (now, name)
+        return name
+
+    def search_players(self, prefix: str, *, limit: int = 20) -> List[Tuple[str, str]]:
+        if not prefix:
+            return []
+        limit = max(1, min(limit, 100))
+        try:
+            with self._engine.connect() as connection:
+                rows = connection.execute(
+                    self._search_query,
+                    {"search": f"{prefix}%", "limit": limit},
+                ).fetchall()
+        except SQLAlchemyError:
+            logging.exception("Failed to search player names for prefix %s", prefix)
+            return []
+
+        results: List[Tuple[str, str]] = []
+        for row in rows:
+            if len(row) < 2:
+                continue
+            steam_id_raw, name_raw = row[0], row[1]
+            if steam_id_raw is None or name_raw is None:
+                continue
+            steam_id = str(steam_id_raw).strip()
+            player_name = str(name_raw).strip()
+            if steam_id and player_name:
+                results.append((steam_id, player_name))
+        return results
 
 
 class VipHttpClient:
@@ -1155,6 +1299,8 @@ class VipHttpClient:
         player_id: str,
         description: str,
         expiration_iso: Optional[str],
+        *,
+        player_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "player_id": player_id,
@@ -1162,6 +1308,8 @@ class VipHttpClient:
         }
         if expiration_iso:
             payload["expiration"] = expiration_iso
+        if player_name:
+            payload["player_name"] = player_name
 
         try:
             response = self._request_with_reauth("POST", "add_vip", json_payload=payload)
@@ -1217,9 +1365,10 @@ class PlayerIDModal(Modal):
 
         discord_id = str(interaction.user.id)
         previous_steam_id = self.database.fetch_player(discord_id)
+        player_name = self._parent_view.bot.lookup_player_name(steam_id)
 
         try:
-            self.database.upsert_player(discord_id, steam_id)
+            self.database.upsert_player(discord_id, steam_id, player_name=player_name)
         except DuplicateSteamIDError as exc:
             await interaction.response.send_message(
                 "Error: That T17 ID is already linked to another Discord account. A moderator has been notified.",
@@ -1229,10 +1378,11 @@ class PlayerIDModal(Modal):
             await self.notifier.notify_duplicate(interaction, exc.steam_id, exc.existing_discord_id)
             return
 
+        display_id = f"{steam_id} ({player_name})" if player_name else steam_id
         if previous_steam_id and previous_steam_id != steam_id:
-            message = f"Your T17 ID was updated to {steam_id}."
+            message = f"Your T17 ID was updated to {display_id}."
         else:
-            message = f"Your T17 ID {steam_id} has been saved!"
+            message = f"Your T17 ID {display_id} has been saved!"
 
         await interaction.response.send_message(message, ephemeral=True)
         schedule_ephemeral_cleanup(interaction)
@@ -1263,10 +1413,13 @@ class CombinedView(PersistentView):
 
     @discord.ui.button(label="Register", style=ButtonStyle.danger, custom_id="frontline-pass-register")
     async def register_button(self, interaction: discord.Interaction, _: Button) -> None:
-        existing = self.database.fetch_player(str(interaction.user.id))
+        discord_id = str(interaction.user.id)
+        existing = self.database.fetch_player(discord_id)
         if existing:
+            stored_name = self.database.fetch_player_name(discord_id)
+            display = f"{existing} ({stored_name})" if stored_name else existing
             await interaction.response.send_message(
-                "You're already registered. Your T17 and Discord IDs are linked.",
+                f"You're already registered. Your T17 ID `{display}` is linked to your Discord account.",
                 ephemeral=True,
             )
             schedule_ephemeral_cleanup(interaction)
@@ -1276,7 +1429,8 @@ class CombinedView(PersistentView):
 
     @discord.ui.button(label="Get VIP", style=ButtonStyle.green, custom_id="frontline-pass-get-vip")
     async def give_vip_button(self, interaction: discord.Interaction, _: Button) -> None:
-        steam_id = self.database.fetch_player(str(interaction.user.id))
+        discord_id = str(interaction.user.id)
+        steam_id = self.database.fetch_player(discord_id)
 
         if not steam_id:
             await interaction.response.send_message(
@@ -1286,6 +1440,8 @@ class CombinedView(PersistentView):
             schedule_ephemeral_cleanup(interaction)
             return
 
+        player_name = self.database.fetch_player_name(discord_id)
+        player_display = f"{steam_id} ({player_name})" if player_name else steam_id
         duration_hours = self.bot.vip_duration_hours
         local_time = datetime.now(self.config.timezone)
         expiration_time_local = local_time + timedelta(hours=duration_hours)
@@ -1301,6 +1457,7 @@ class CombinedView(PersistentView):
                 steam_id,
                 comment,
                 expiration_time_iso,
+                player_name=player_name,
             )
         except RconError as exc:
             logging.exception("Failed to grant VIP for player %s", steam_id)
@@ -1324,7 +1481,7 @@ class CombinedView(PersistentView):
         readable_expiration = expiration_time_local.strftime("%Y-%m-%d %H:%M:%S %Z")
         logging.info(
             "Granted VIP for player %s until %s UTC (%s)",
-            steam_id,
+            player_display,
             expiration_time_utc_str,
             "; ".join(result.status_lines),
         )
@@ -1335,6 +1492,7 @@ class CombinedView(PersistentView):
         followup_message = await interaction.followup.send(
             (
                 f"You now have VIP for {self.config.vip_duration_label} hours! "
+                f"Linked ID: {player_display}\n"
                 f"Expiration: {readable_expiration}\n\n**Status**:\n{status_summary}"
             ),
             ephemeral=True,
@@ -1354,17 +1512,34 @@ def create_database(config: AppConfig) -> Database:
     return Database(config.database_path, config.database_table)
 
 
+def create_player_directory(config: AppConfig) -> Optional[PlayerDirectory]:
+    if not config.crcon_database_url:
+        return None
+    try:
+        directory = PlayerDirectory(config.crcon_database_url)
+    except Exception:
+        logging.exception("Failed to initialise PlayerDirectory for %s", config.crcon_database_url)
+        return None
+    return directory
+
+
 class FrontlinePassBot(commands.Bot):
-    def __init__(self, config: AppConfig, database: Database, vip_service: VipService) -> None:
+    def __init__(self, config: AppConfig, database: Database, vip_service: VipService, player_directory: Optional[PlayerDirectory] = None) -> None:
         intents = discord.Intents.default()
         super().__init__(command_prefix="!", intents=intents)
         self.config = config
         self.database = database
         self.vip_service = vip_service
+        self.player_directory = player_directory
         self.notifier = ModeratorNotifier(config)
         self.persistent_view: Optional[CombinedView] = None
         self.announcement_manager = AnnouncementManager(config, database)
         self._vip_duration_hours = self._load_vip_duration()
+
+    def lookup_player_name(self, steam_id: str) -> Optional[str]:
+        if self.player_directory:
+            return self.player_directory.lookup_player_name(steam_id)
+        return None
 
     async def setup_hook(self) -> None:
         self.persistent_view = CombinedView(self, self.config, self.database, self.vip_service, self.notifier)
@@ -1591,15 +1766,21 @@ class FrontlinePassBot(commands.Bot):
             schedule_ephemeral_cleanup(interaction)
 
 
-def create_bot(config: AppConfig, database: Database, vip_service: VipService) -> commands.Bot:
-    return FrontlinePassBot(config, database, vip_service)
+def create_bot(
+    config: AppConfig,
+    database: Database,
+    vip_service: VipService,
+    player_directory: Optional[PlayerDirectory] = None,
+) -> commands.Bot:
+    return FrontlinePassBot(config, database, vip_service, player_directory)
 
 
 def main() -> None:
     config = load_config()
     database = create_database(config)
-    vip_service = VipService(config)
-    bot = create_bot(config, database, vip_service)
+    player_directory = create_player_directory(config)
+    vip_service = VipService(config, player_directory)
+    bot = create_bot(config, database, vip_service, player_directory)
     bot.run(config.discord_token)
 
 

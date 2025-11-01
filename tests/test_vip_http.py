@@ -106,6 +106,26 @@ class VipHttpClientTests(unittest.TestCase):
         self.assertIn("Authorization", call["headers"])
         self.assertEqual(call["headers"]["Authorization"], "Bearer abc123")
 
+    def test_add_vip_includes_player_name(self) -> None:
+        session = DummySession(DummyResponse(200, {"result": "ok"}))
+        client = VipHttpClient(
+            HttpCredentials(base_url="https://example/api", bearer_token="abc123"),
+            session=session,
+        )
+
+        client.add_vip("player-id", "desc", None, player_name="GBONE001")
+
+        self.assertEqual(len(session.calls), 1)
+        call = session.calls[0]
+        self.assertEqual(
+            call["json"],
+            {
+                "player_id": "player-id",
+                "description": "desc",
+                "player_name": "GBONE001",
+            },
+        )
+
     def test_add_vip_rejects_non_200(self) -> None:
         session = DummySession(DummyResponse(401, {"error": "unauthorized"}))
         client = VipHttpClient(
@@ -180,10 +200,11 @@ class VipServiceTests(unittest.TestCase):
                 base_url="https://example/api",
                 bearer_token="abc123",
             ),
+            crcon_database_url=None,
         )
 
     def test_prefers_http_before_rcon(self) -> None:
-        service = VipService(self.config)
+        service = VipService(self.config, None)
         fake_http_client = mock.Mock()
         fake_http_client.add_vip.return_value = {"result": "ok"}
         service._http_client = fake_http_client  # type: ignore[attr-defined]
@@ -191,9 +212,28 @@ class VipServiceTests(unittest.TestCase):
 
         result = service.grant_vip("steam123", "comment", None)
 
-        fake_http_client.add_vip.assert_called_once_with("steam123", "comment", None)
+        fake_http_client.add_vip.assert_called_once()
+        args, kwargs = fake_http_client.add_vip.call_args
+        self.assertEqual(args[:3], ("steam123", "comment", None))
+        self.assertIsNone(kwargs.get("player_name"))
         service._grant_vip_via_rcon.assert_not_called()  # type: ignore[attr-defined]
         self.assertIn("HTTP API", result.status_lines[0])
+
+    def test_passes_player_name_when_directory_available(self) -> None:
+        directory = mock.Mock()
+        directory.lookup_player_name.return_value = "GBONE001"
+        service = VipService(self.config, directory)
+        fake_http_client = mock.Mock()
+        fake_http_client.add_vip.return_value = {"result": "ok"}
+        service._http_client = fake_http_client  # type: ignore[attr-defined]
+        service._grant_vip_via_rcon = mock.Mock()  # type: ignore[attr-defined]
+
+        service.grant_vip("steam123", "comment", None)
+
+        directory.lookup_player_name.assert_called_once_with("steam123")
+        fake_http_client.add_vip.assert_called_once()
+        _, kwargs = fake_http_client.add_vip.call_args
+        self.assertEqual(kwargs.get("player_name"), "GBONE001")
 
 
 class DatabaseTests(unittest.TestCase):
@@ -255,6 +295,40 @@ class DatabaseTests(unittest.TestCase):
             with open(db_path, "rb") as handle:
                 header = handle.read(16)
             self.assertTrue(header.startswith(b"SQLite format 3"))
+
+
+class PlayerDirectoryTests(unittest.TestCase):
+    def test_lookup_player_name_returns_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = pathlib.Path(tmpdir) / "players.db"
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute(
+                    """
+                    CREATE TABLE player_names (
+                        playersteamid_id TEXT,
+                        name TEXT,
+                        last_seen TIMESTAMP
+                    )
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO player_names (playersteamid_id, name, last_seen) VALUES (?, ?, ?)",
+                    ("111", "OlderName", "2024-01-01 00:00:00"),
+                )
+                connection.execute(
+                    "INSERT INTO player_names (playersteamid_id, name, last_seen) VALUES (?, ?, ?)",
+                    ("111", "LatestName", "2025-01-01 00:00:00"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            directory = frontline_pass.PlayerDirectory(f"sqlite:///{db_path}")
+            try:
+                self.assertEqual(directory.lookup_player_name("111"), "LatestName")
+            finally:
+                directory._engine.dispose()
 
 
 if __name__ == "__main__":
