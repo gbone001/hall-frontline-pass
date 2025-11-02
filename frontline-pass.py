@@ -34,6 +34,24 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
+# --- helpers ---------------------------------------------------------------
+def _schedule_ephemeral_cleanup(interaction, *, message=None, delay: float = 30.0) -> None:
+    """
+    Best-effort cleanup for ephemeral follow-ups. Safe if perms missing.
+    """
+    try:
+        import asyncio
+        async def _cleanup():
+            try:
+                await asyncio.sleep(delay)
+                if message is not None:
+                    await message.delete()
+            except Exception:
+                pass
+        asyncio.create_task(_cleanup())
+    except Exception:
+        pass
+
 logging.basicConfig(level=logging.INFO)
 
 ANNOUNCEMENT_TITLE = "VIP Control Center"
@@ -1643,7 +1661,9 @@ class CombinedView(PersistentView):
         self._refresh_button_label()
 
     @discord.ui.button(label="Register", style=ButtonStyle.danger, custom_id="frontline-pass-register")
-    async def register_button(self, interaction: discord.Interaction, _: Button) -> None:
+async def register_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+    """Hardened handler with error trapping + UX for PlayerDirectory present."""
+    try:
         discord_id = str(interaction.user.id)
         existing = self.database.fetch_player(discord_id)
         if existing:
@@ -1653,209 +1673,45 @@ class CombinedView(PersistentView):
                 f"You're already registered. Your T17 ID `{display}` is linked to your Discord account.",
                 ephemeral=True,
             )
-            schedule_ephemeral_cleanup(interaction)
+            _schedule_ephemeral_cleanup(interaction)
             return
 
-        if self.bot.player_directory:
-            command = interaction.client.tree.get_command("register_player") if hasattr(interaction.client, "tree") else None
-            command_mention = command.mention if command else "/register_player"
+        # If a PlayerDirectory is configured, guide to slash + manual fallback
+        if getattr(self.bot, "player_directory", None):
+            try:
+                command = interaction.client.tree.get_command("register_player")
+            except Exception:
+                command = None
+            command_mention = getattr(command, "mention", "/register_player")
             view = ManualEntryPromptView(self)
-            message = (
-                f"Use {command_mention} and start typing to search for your player. "
-                "Select the correct entry to link your Discord account.\n"
-                "Can't find it? Click the button below to enter your T17 ID manually."
+            await interaction.response.send_message(
+                f"Use {command_mention} to search and select your player.\n"
+                "Can't find it? Click the button below to enter your T17 ID manually.",
+                view=view, ephemeral=True
             )
-            await interaction.response.send_message(message, view=view, ephemeral=True)
-            schedule_ephemeral_cleanup(interaction)
+            _schedule_ephemeral_cleanup(interaction)
             return
 
+        # No directory: open manual modal
         await interaction.response.send_modal(PlayerIDModal(self))
 
-    @discord.ui.button(label="Get VIP", style=ButtonStyle.green, custom_id="frontline-pass-get-vip")
-    async def give_vip_button(self, interaction: discord.Interaction, _: Button) -> None:
-        discord_id = str(interaction.user.id)
-        steam_id = self.database.fetch_player(discord_id)
-
-        if not steam_id:
-            await interaction.response.send_message(
-                "You are not linked to a T17 account. Please register first.",
-                ephemeral=True,
-            )
-            schedule_ephemeral_cleanup(interaction)
-            return
-
-        player_name = self.database.fetch_player_name(discord_id)
-        player_display = f"{steam_id} ({player_name})" if player_name else steam_id
-        duration_hours = self.bot.vip_duration_hours
-        local_time = datetime.now(self.config.timezone)
-        expiration_time_local = local_time + timedelta(hours=duration_hours)
-        expiration_time_utc = expiration_time_local.astimezone(pytz.utc)
-        expiration_time_utc_str = expiration_time_utc.strftime("%Y-%m-%d %H:%M:%S")
-        expiration_time_iso = expiration_time_utc.isoformat()
-        comment = f"Discord VIP for {interaction.user.display_name} until {expiration_time_utc_str} UTC"
-
-        await interaction.response.defer(ephemeral=True)
-        try:
-            result = await asyncio.to_thread(
-                self.vip_service.grant_vip,
-                steam_id,
-                comment,
-                expiration_time_iso,
-                player_name=player_name,
-            )
-        except RconError as exc:
-            logging.exception("Failed to grant VIP for player %s", steam_id)
-            followup_message = await interaction.followup.send(
-                f"Error: VIP status could not be set: {exc}",
-                ephemeral=True,
-                wait=True,
-            )
-            schedule_ephemeral_cleanup(interaction, message=followup_message)
-            return
-        except Exception as exc:  # pragma: no cover
-            logging.exception("Unexpected error while granting VIP for player %s: %s", steam_id, exc)
-            followup_message = await interaction.followup.send(
-                "An unexpected error occurred while setting VIP status.",
-                ephemeral=True,
-                wait=True,
-            )
-            schedule_ephemeral_cleanup(interaction, message=followup_message)
-            return
-
-        readable_expiration = expiration_time_local.strftime("%Y-%m-%d %H:%M:%S %Z")
-        logging.info(
-            "Granted VIP for player %s until %s UTC (%s)",
-            player_display,
-            expiration_time_utc_str,
-            "; ".join(result.status_lines),
-        )
-        self.database.set_metadata(LAST_GRANT_METADATA_KEY, datetime.now(timezone.utc).isoformat())
-        if isinstance(interaction.client, FrontlinePassBot):
-            await interaction.client.refresh_announcement_message()
-        status_summary = "\n".join(f"- {line}" for line in result.status_lines)
-        followup_message = await interaction.followup.send(
-            (
-                f"You now have VIP for {self.config.vip_duration_label} hours! "
-                f"Linked ID: {player_display}\n"
-                f"Expiration: {readable_expiration}\n\n**Status**:\n{status_summary}"
-            ),
-            ephemeral=True,
-            wait=True,
-        )
-        schedule_ephemeral_cleanup(interaction, message=followup_message)
-        # If the user had a temporary VIP Discord role for registration/claim, remove it now.
-        await self._maybe_remove_temp_vip_role(interaction)
-
-
-    def _refresh_button_label(self) -> None:
-        self.give_vip_button.label = f"Get VIP ({self.bot.vip_duration_hours:g} hours)"
-
-    def refresh_vip_label(self) -> None:
-        self._refresh_button_label()
-
-    async def complete_registration(
-        self,
-        interaction: discord.Interaction,
-        steam_id: str,
-        *,
-        player_name: Optional[str] = None,
-    ) -> None:
-        steam_id = steam_id.strip()
-        if not steam_id:
-            if interaction.response.is_done():
-                followup_message = await interaction.followup.send(
-                    "T17 ID cannot be empty.",
-                    ephemeral=True,
-                    wait=True,
-                )
-                schedule_ephemeral_cleanup(interaction, message=followup_message)
-            else:
-                await interaction.response.send_message("T17 ID cannot be empty.", ephemeral=True)
-                schedule_ephemeral_cleanup(interaction)
-            return
-
-        discord_id = str(interaction.user.id)
-        previous_steam_id = self.database.fetch_player(discord_id)
-        resolved_name = player_name or self.bot.lookup_player_name(steam_id)
-
-        try:
-            self.database.upsert_player(discord_id, steam_id, player_name=resolved_name)
-        except DuplicateSteamIDError as exc:
-            duplicate_message = (
-                "Error: That T17 ID is already linked to another Discord account. "
-                "A moderator has been notified."
-            )
-            if interaction.response.is_done():
-                followup_message = await interaction.followup.send(
-                    duplicate_message,
-                    ephemeral=True,
-                    wait=True,
-                )
-                schedule_ephemeral_cleanup(interaction, message=followup_message)
-            else:
-                await interaction.response.send_message(duplicate_message, ephemeral=True)
-                schedule_ephemeral_cleanup(interaction)
-            await self.notifier.notify_duplicate(interaction, exc.steam_id, exc.existing_discord_id)
-            return
-
-        display_id = f"{steam_id} ({resolved_name})" if resolved_name else steam_id
-        if previous_steam_id and previous_steam_id != steam_id:
-            success_message = f"Your T17 ID was updated to {display_id}."
-        else:
-            success_message = f"Your T17 ID {display_id} has been saved!"
-
-        if interaction.response.is_done():
-            followup_message = await interaction.followup.send(
-                success_message,
-                ephemeral=True,
-                wait=True,
-            )
-            schedule_ephemeral_cleanup(interaction, message=followup_message)
-        else:
-            await interaction.response.send_message(success_message, ephemeral=True)
-            schedule_ephemeral_cleanup(interaction)
-
-        await self.bot.refresh_announcement_message()
-
-    async def _maybe_remove_temp_vip_role(self, interaction: discord.Interaction) -> None:
-        role_id = getattr(self.config, "vip_temp_role_id", None)
-        if not role_id:
-            return
-        guild = interaction.guild
-        if guild is None:
-            return
-        # interaction.user can be a Member in guild contexts
-        user = interaction.user
-        if not isinstance(user, discord.Member):
-            try:
-                # Try to fetch member if possible
-                user = await guild.fetch_member(interaction.user.id)
-            except discord.DiscordException:
-                return
-        role = guild.get_role(role_id)
-        if role is None:
-            return
-        if role in getattr(user, "roles", []):
-            try:
-                await user.remove_roles(role, reason="Frontline Pass: remove temporary VIP role after claim")
-                logging.info("Removed temporary VIP role %s from %s after claim", role_id, user.id)
-            except discord.DiscordException:
-                logging.exception("Failed to remove temporary VIP role %s from %s", role_id, user.id)
-
-
-def create_database(config: AppConfig) -> Database:
-    return Database(config.database_path, config.database_table)
-
-
-def create_player_directory(config: AppConfig) -> Optional[PlayerDirectory]:
-    if not config.crcon_database_url:
-        return None
-    try:
-        directory = PlayerDirectory(config.crcon_database_url)
     except Exception:
-        logging.exception("Failed to initialise PlayerDirectory for %s", config.crcon_database_url)
-        return None
-    return directory
+        logging.exception("Register button failed")
+        try:
+            if interaction.response.is_done():
+                msg = await interaction.followup.send(
+                    "Registration failed due to an internal error. Mods have been notified.",
+                    ephemeral=True, wait=True
+                )
+                _schedule_ephemeral_cleanup(interaction, message=msg)
+            else:
+                await interaction.response.send_message(
+                    "Registration failed due to an internal error. Mods have been notified.",
+                    ephemeral=True
+                )
+                _schedule_ephemeral_cleanup(interaction)
+        except Exception:
+            pass
 
 
 class FrontlinePassBot(commands.Bot):
@@ -2310,3 +2166,45 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    @app_commands.command(name="frontline_health", description="Report Frontline Pass status and wiring")
+    async def frontline_health(self, interaction: discord.Interaction) -> None:
+        try:
+            view_ok = bool(getattr(self, "persistent_view", None))
+            try:
+                ann_id = self.database.get_metadata("announcement_message_id")
+            except Exception:
+                ann_id = None
+            db_backend = getattr(self.database, "backend", "json")
+            db_path = getattr(self.database, "path", getattr(self.database, "_path", "unknown"))
+            await interaction.response.send_message(
+                f"View attached: {view_ok}\n"
+                f"DB backend: {db_backend} @ {db_path}\n"
+                f"VIP hours: {self.vip_duration_hours:g}\n"
+                f"Announcement ID: {ann_id}",
+                ephemeral=True
+            )
+        except Exception:
+            logging.exception("frontline_health failed")
+            if interaction.response.is_done():
+                await interaction.followup.send("Health check failed. See logs.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Health check failed. See logs.", ephemeral=True)
+    @app_commands.command(name="frontline_reset_announcement", description="Repost control center with fresh buttons")
+    async def frontline_reset_announcement(self, interaction: discord.Interaction) -> None:
+        def _is_mod(user):
+            return getattr(getattr(user, "guild_permissions", None), "manage_guild", False)
+        if not _is_mod(interaction.user):
+            await interaction.response.send_message("Insufficient permissions.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            try:
+                await self.refresh_announcement_message(force_new=False)
+                await interaction.followup.send("Announcement refreshed.", ephemeral=True)
+            except Exception:
+                logging.exception("Failed to edit existing announcement; posting a fresh one.")
+                await self.refresh_announcement_message(force_new=True)
+                await interaction.followup.send("Announcement re-posted with fresh components.", ephemeral=True)
+        except Exception:
+            logging.exception("frontline_reset_announcement failed")
+            await interaction.followup.send("Reset failed. See logs.", ephemeral=True)
