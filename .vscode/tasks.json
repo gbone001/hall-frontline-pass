@@ -1,0 +1,12 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "deploy-to-server",
+      "type": "shell",
+      "command": "ssh user@server 'cd /path/to/app && ./deploy.sh'",
+      "group": "build",
+      "problemMatcher": []
+    }
+  ]
+}
