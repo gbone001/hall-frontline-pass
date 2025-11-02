@@ -1,9 +1,12 @@
 {
   DISCORD_TOKEN: "your-discord-token",
-  CHANNEL_ID: 123456789012345678,
+  CHANNEL_ID: 1245678,
   MODERATION_CHANNEL_ID: null,
   MODERATOR_ROLE_ID: null,
   ANNOUNCEMENT_MESSAGE_ID: null,
+  // Temporary VIP role + claim channel (used by /assignvip)
+  VIP_TEMP_ROLE_ID: 14346053502,
+  VIP_CLAIM_CHANNEL_ID: 1415832535944
   VIP_DURATION_HOURS: 72,
   LOCAL_TIMEZONE: "Australia/Sydney",
   RCON_HOST: "127.0.0.1",
