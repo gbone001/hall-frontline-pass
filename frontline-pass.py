@@ -1661,57 +1661,234 @@ class CombinedView(PersistentView):
         self._refresh_button_label()
 
     @discord.ui.button(label="Register", style=ButtonStyle.danger, custom_id="frontline-pass-register")
-async def register_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-    """Hardened handler with error trapping + UX for PlayerDirectory present."""
-    try:
-        discord_id = str(interaction.user.id)
-        existing = self.database.fetch_player(discord_id)
-        if existing:
-            stored_name = self.database.fetch_player_name(discord_id)
-            display = f"{existing} ({stored_name})" if stored_name else existing
-            await interaction.response.send_message(
-                f"You're already registered. Your T17 ID `{display}` is linked to your Discord account.",
-                ephemeral=True,
-            )
-            _schedule_ephemeral_cleanup(interaction)
-            return
-
-        # If a PlayerDirectory is configured, guide to slash + manual fallback
-        if getattr(self.bot, "player_directory", None):
-            try:
-                command = interaction.client.tree.get_command("register_player")
-            except Exception:
-                command = None
-            command_mention = getattr(command, "mention", "/register_player")
-            view = ManualEntryPromptView(self)
-            await interaction.response.send_message(
-                f"Use {command_mention} to search and select your player.\n"
-                "Can't find it? Click the button below to enter your T17 ID manually.",
-                view=view, ephemeral=True
-            )
-            _schedule_ephemeral_cleanup(interaction)
-            return
-
-        # No directory: open manual modal
-        await interaction.response.send_modal(PlayerIDModal(self))
-
-    except Exception:
-        logging.exception("Register button failed")
+    async def register_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        """Hardened handler with error trapping + UX for PlayerDirectory present."""
         try:
-            if interaction.response.is_done():
-                msg = await interaction.followup.send(
-                    "Registration failed due to an internal error. Mods have been notified.",
-                    ephemeral=True, wait=True
-                )
-                _schedule_ephemeral_cleanup(interaction, message=msg)
-            else:
+            discord_id = str(interaction.user.id)
+            existing = self.database.fetch_player(discord_id)
+            if existing:
+                stored_name = self.database.fetch_player_name(discord_id)
+                display = f"{existing} ({stored_name})" if stored_name else existing
                 await interaction.response.send_message(
-                    "Registration failed due to an internal error. Mods have been notified.",
-                    ephemeral=True
+                    f"You're already registered. Your T17 ID `{display}` is linked to your Discord account.",
+                    ephemeral=True,
                 )
                 _schedule_ephemeral_cleanup(interaction)
+                return
+
+            # If a PlayerDirectory is configured, guide to slash + manual fallback
+            if getattr(self.bot, "player_directory", None):
+                try:
+                    command = interaction.client.tree.get_command("register_player")
+                except Exception:
+                    command = None
+                command_mention = getattr(command, "mention", "/register_player")
+                view = ManualEntryPromptView(self)
+                await interaction.response.send_message(
+                    f"Use {command_mention} to search and select your player.\n"
+                    "Can't find it? Click the button below to enter your T17 ID manually.",
+                    view=view,
+                    ephemeral=True,
+                )
+                _schedule_ephemeral_cleanup(interaction)
+                return
+
+            # No directory: open manual modal
+            await interaction.response.send_modal(PlayerIDModal(self))
+
         except Exception:
-            pass
+            logging.exception("Register button failed")
+            try:
+                if interaction.response.is_done():
+                    msg = await interaction.followup.send(
+                        "Registration failed due to an internal error. Mods have been notified.",
+                        ephemeral=True,
+                        wait=True,
+                    )
+                    _schedule_ephemeral_cleanup(interaction, message=msg)
+                else:
+                    await interaction.response.send_message(
+                        "Registration failed due to an internal error. Mods have been notified.",
+                        ephemeral=True,
+                    )
+                    _schedule_ephemeral_cleanup(interaction)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Get VIP", style=ButtonStyle.success, custom_id="frontline-pass-get-vip")
+    async def get_vip_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        """Grant VIP to the invoking user based on their registered Player-ID."""
+        await interaction.response.defer(ephemeral=True)
+
+        discord_id = str(interaction.user.id)
+        steam_id = await asyncio.to_thread(self.database.fetch_player, discord_id)
+        if not steam_id:
+            followup = await interaction.followup.send(
+                "You haven't registered a Player-ID yet. Use the Register button or /register_player first.",
+                ephemeral=True,
+                wait=True,
+            )
+            _schedule_ephemeral_cleanup(interaction, message=followup)
+            return
+
+        player_name = await asyncio.to_thread(self.database.fetch_player_name, discord_id)
+        if not player_name:
+            player_name = self.bot.lookup_player_name(steam_id)
+
+        expiration_iso: Optional[str] = None
+        expiry_text: Optional[str] = None
+        hours = getattr(self.bot, "vip_duration_hours", self.config.vip_duration_hours)
+        if hours and hours > 0:
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=hours)
+            expiration_iso = expires_at.replace(microsecond=0).isoformat()
+            local_expiry = expires_at.astimezone(self.config.timezone)
+            expiry_text = local_expiry.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+        try:
+            result = await asyncio.to_thread(
+                self.vip_service.grant_vip,
+                steam_id,
+                f"frontline-pass:{discord_id}",
+                expiration_iso,
+                player_name=player_name,
+            )
+        except RconError as exc:
+            logging.exception("Failed to grant VIP for %s (%s)", steam_id, discord_id)
+            followup = await interaction.followup.send(
+                f"Failed to grant VIP: {exc}",
+                ephemeral=True,
+                wait=True,
+            )
+            _schedule_ephemeral_cleanup(interaction, message=followup)
+            return
+
+        now_utc = datetime.now(timezone.utc)
+        await asyncio.to_thread(self.database.set_metadata, LAST_GRANT_METADATA_KEY, now_utc.isoformat())
+
+        message_lines = [f"VIP granted to `{steam_id}`."]
+        if player_name:
+            message_lines[0] += f" ({player_name})"
+        if expiry_text:
+            message_lines.append(f"Expires at {expiry_text}.")
+        message_lines.extend(result.status_lines or [])
+        followup = await interaction.followup.send(
+            "\n".join(message_lines),
+            ephemeral=True,
+            wait=True,
+        )
+        _schedule_ephemeral_cleanup(interaction, message=followup)
+
+        await self._remove_temporary_role(interaction)
+        try:
+            await self.bot.refresh_announcement_message()
+        except Exception:
+            logging.exception("Failed to refresh announcement after VIP grant.")
+
+    def refresh_vip_label(self) -> None:
+        """Public hook so the bot can refresh button labels after config changes."""
+        self._refresh_button_label()
+
+    def _refresh_button_label(self) -> None:
+        button = getattr(self, "get_vip_button", None)
+        if not isinstance(button, discord.ui.Button):
+            return
+        hours = getattr(self.bot, "vip_duration_hours", None)
+        if hours and hours > 0:
+            button.label = f"Get VIP ({hours:g}h)"
+        else:
+            button.label = "Get VIP"
+
+    async def complete_registration(
+        self,
+        interaction: discord.Interaction,
+        steam_id: str,
+        *,
+        player_name: Optional[str] = None,
+    ) -> None:
+        """Persist the provided Player-ID for the invoking Discord user."""
+        discord_id = str(interaction.user.id)
+        sanitized = str(steam_id or "").strip().replace(" ", "")
+        if not sanitized:
+            await self._send_registration_response(
+                interaction,
+                "Player-ID cannot be empty. Please try again.",
+            )
+            return
+        if not sanitized.isdigit():
+            await self._send_registration_response(
+                interaction,
+                "Player-ID must contain digits only.",
+            )
+            return
+
+        try:
+            await asyncio.to_thread(
+                self.database.upsert_player,
+                discord_id,
+                sanitized,
+                player_name=player_name,
+            )
+        except DuplicateSteamIDError as exc:
+            await self.notifier.notify_duplicate(interaction, sanitized, exc.existing_discord_id)
+            await self._send_registration_response(
+                interaction,
+                "That Player-ID is already linked to another Discord account. Contact a moderator if this seems wrong.",
+            )
+            return
+        except Exception:
+            logging.exception("Failed to register Player-ID %s for %s", sanitized, discord_id)
+            await self._send_registration_response(
+                interaction,
+                "Registration failed due to an internal error. Moderators have been notified.",
+            )
+            return
+
+        cached_name = player_name or self.bot.lookup_player_name(sanitized)
+        if cached_name:
+            self.bot._autocomplete_cache[sanitized] = cached_name
+
+        message = f"Linked Player-ID `{sanitized}` to your Discord account."
+        if cached_name:
+            message += f" Last seen name: **{cached_name}**."
+        await self._send_registration_response(interaction, message)
+
+    async def _send_registration_response(
+        self,
+        interaction: discord.Interaction,
+        content: str,
+    ) -> None:
+        if interaction.response.is_done():
+            message = await interaction.followup.send(content, ephemeral=True, wait=True)
+            _schedule_ephemeral_cleanup(interaction, message=message)
+        else:
+            await interaction.response.send_message(content, ephemeral=True)
+            _schedule_ephemeral_cleanup(interaction)
+
+    async def _remove_temporary_role(self, interaction: discord.Interaction) -> None:
+        role_id = self.config.vip_temp_role_id
+        if not role_id:
+            return
+        guild = interaction.guild
+        if guild is None:
+            return
+        member: Optional[discord.Member]
+        if isinstance(interaction.user, discord.Member):
+            member = interaction.user
+        else:
+            try:
+                member = await guild.fetch_member(interaction.user.id)
+            except discord.DiscordException:
+                logging.exception("Failed to fetch guild member %s for role cleanup", interaction.user.id)
+                return
+        if member is None:
+            return
+        role = guild.get_role(role_id)
+        if role is None or role not in getattr(member, "roles", []):
+            return
+        try:
+            await member.remove_roles(role, reason="Frontline Pass: VIP claim complete")
+        except discord.DiscordException:
+            logging.exception("Failed to remove temporary VIP role %s from %s", role_id, member.id)
 
 
 class FrontlinePassBot(commands.Bot):
@@ -2144,6 +2321,25 @@ class FrontlinePassBot(commands.Bot):
                         ephemeral=True,
                         wait=False,
                     )
+
+
+def create_database(config: AppConfig) -> Database:
+    """Instantiate the configured database backend."""
+    return Database(config.database_path, config.database_table)
+
+
+def create_player_directory(config: AppConfig) -> Optional[PlayerDirectory]:
+    """Build a PlayerDirectory when a CRCON database URL is provided."""
+    if not config.crcon_database_url:
+        return None
+    try:
+        return PlayerDirectory(config.crcon_database_url)
+    except Exception:
+        logging.exception(
+            "Failed to initialize PlayerDirectory for %s",
+            config.crcon_database_url,
+        )
+        return None
 
 
 def create_bot(
