@@ -1,60 +1,43 @@
 ## Purpose
-Quick on-boarding notes for AI coding agents working on this repository. Focus on the runtime entrypoints, environment configuration, integration points (RCON + MySQL), and common project patterns discovered in the code.
+Short onboarding notes for AI coding agents working on this repository. Focus on the runtime entrypoint, config, external integrations (CRCON/RCON), and developer workflows you’ll need to modify or run the bot.
 
-## Where to look first
-- `frontline-pass.py` — single-file application and the canonical source of runtime behavior. Read top-to-bottom to understand DB initialization, Discord UI flows, and the RCON client implementation.
-- `README.md` — setup and environment variable expectations; reproduces most run instructions.
-- `hall-frontline-pass.service.dist` — example systemd unit used in production. Shows how the script is executed on a server.
-- `requirements.txt` — pinned runtime dependencies.
+### Quick facts
+- Single-file Python app: `frontline-pass.py` is the canonical source and runtime entrypoint (it calls `bot.run(DISCORD_TOKEN)`).
+- Config: `config.jsonc` (JSON5) is primary; `.env` is read via `dotenv` as overrides. The loader also accepts `FRONTLINE_CONFIG_PATH`.
+- Data: player links stored in `vip-data.json` (location resolved by `_resolve_database_path()`).
+- Deployment helper: `manage_frontline_pass.sh` and `hall-frontline-pass.service.dist` (systemd template) for production.
 
-## Big picture
-- This is a small Discord bot: a single Python process started with `python frontline-pass.py` (entrypoint is `bot.run(DISCORD_TOKEN)`).
-- On import the script: 1) reads `.env` via `dotenv`, 2) opens a MySQL connection and ensures the `DATABASE_TABLE` exists, and 3) constructs bot commands/UI. That means database connectivity happens at module-import time — reloading or importing the module in tests will try to connect to MySQL immediately.
-- Primary integrations:
-  - MySQL (via `mysql-connector-python`) for mapping Discord IDs to player IDs. The table is created with the columns `id, discord_id, steam_id`.
-  - Hell Let Loose RCON V2 — custom `RconClient` implemented in the same file. The main RCON command used is `AddVip`.
+### Where to look first
+- `frontline-pass.py` — read top-to-bottom. It: loads config, initializes the database (creates table or JSON file), constructs Discord UI, and implements `RconClient` + `grant_vip()`.
+- `manage_frontline_pass.sh` / `hall-frontline-pass.service.dist` — how the service is installed and run under systemd (note the `@<user>` template naming).
+- `requirements.txt`, `.venv/` usage, and `README.md` for install & deploy notes.
 
-## Key environment variables (used in `frontline-pass.py`)
-- `DISCORD_TOKEN` — Discord bot token (required).
-- `VIP_DURATION_HOURS` — numeric, used directly to compute expiration and label text.
-- `CHANNEL_ID` — integer channel where the bot posts the interactive message.
-- `LOCAL_TIMEZONE` — IANA timezone string (e.g. `Europe/Berlin`), parsed with `pytz`.
-- `DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_USER`, `DATABASE_PASSWORD`, `DATABASE_NAME`, `DATABASE_TABLE` — MySQL connection and table name. The script creates the table if missing.
-- `RCON_HOST`, `RCON_PORT`, `RCON_PASSWORD`, `RCON_VERSION` — RCON connection details. The code expects RCON v2 by default.
+### Integration & runtime notes (concrete)
+- CRCON HTTP + RCON fallback: the bot prefers CRCON HTTP API (if configured) and falls back to in-game RCON V2 (`AddVip`). See CRCON keys in `config.jsonc`.
+- RCON implementation is synchronous (socket-based); `grant_vip()` runs the blocking call inside an executor — preserve this pattern when refactoring.
+- DB behavior: the app may open DB connections at import time. In tests, either refactor to a lazy `get_db_conn()` or monkeypatch DB calls to avoid real MySQL connections.
+- Config parsing: uses `json5` so `config.jsonc` accepts unquoted keys and comments — but syntax errors will cause startup to fail (see log message "Loaded configuration from ..." on success).
 
-Example `.env` contents are in `README.md` — follow that format.
+### Developer workflows & commands (practical)
+- Create venv & install deps:
+  python3 -m venv .venv
+  .venv/bin/pip install -r requirements.txt
+- Run in foreground (dev):
+  ./manage_frontline_pass.sh run
+  or
+  .venv/bin/python frontline-pass.py
+- Systemd-managed deployment (recommended for production):
+  ./manage_frontline_pass.sh install   # installs template and enables hall-frontline-pass@$(whoami)
+  ./manage_frontline_pass.sh start|stop|restart|status
+- Logs: when running under systemd use `journalctl -u hall-frontline-pass@$(whoami).service`; when running manually check stdout or the log file you redirect to (e.g. /tmp/frontline-pass.log).
 
-## Runtime & developer workflows
-- Install deps: `pip install -r requirements.txt`.
-- Run locally: `python frontline-pass.py` (blocks in `bot.run`).
-- Service deployment: copy `hall-frontline-pass.service.dist` to `/etc/systemd/system/frontline-pass.service`, update `User` and `WorkingDirectory`, then `systemctl enable --now frontline-pass.service`.
+### Tests & troubleshooting
+- Tests live in `tests/` and use pytest. Because the app initializes external resources at import, run tests with DB/RCON calls stubbed or refactor initialization to be lazy.
+- Common failure on startup: missing required config variables — the loader raises a RuntimeError listing missing keys (e.g., `DISCORD_TOKEN is required`). Check `.env` or `config.jsonc` first.
 
-## Important implementation notes for edits
-- DB connection is established at module import (`conn = mysql.connector.connect(...)`). To avoid opening a real DB connection in unit tests, refactor to use a factory or lazy initialization (e.g., create and export a `get_db_conn()` function) before writing tests.
-- The script executes `CREATE TABLE IF NOT EXISTS ...` at import time. Any change to schema should account for live migrations or move this logic into a small migration helper.
-- The `RconClient` is a synchronous, blocking implementation using sockets and a simple XOR-based encryption handshake returned by `ServerConnect`. It's exercised by `grant_vip()` which is run in an executor from the async Discord handler. When changing RCON logic preserve the context manager API (`with RconClient(...) as client:`).
-- Errors from RCON are wrapped in `RconError`; the UI catches `RconError` and reports to the user. Keep that exception type stable when changing RCON behavior.
+### Useful code references (examples)
+- Granting VIP: `grant_vip(player_id, comment) -> str` (used by the Discord UI). Keep the `RconError` exception shape stable for callers.
+- Announcement/UI: `CombinedView`, `PlayerIDModal`, and `AnnouncementManager` in `frontline-pass.py` show how the bot reuses and reposts the control message.
+- DB insert example: the SQL uses `ON DUPLICATE KEY UPDATE` when storing player links — see the cursor.execute call near the registration flow.
 
-## Patterns and examples in code
-- Discord UI: `CombinedView` provides two `@discord.ui.button` handlers — `Register` opens `PlayerIDModal`, `get VIP (...)` reads DB and delegates to `grant_vip()`.
-- Storing player IDs example:
-  cursor.execute("INSERT INTO `{}` (discord_id, steam_id) VALUES (%s, %s) ON DUPLICATE KEY UPDATE steam_id = %s", (str(interaction.user.id), steam_id, steam_id))
-- Time handling: the script computes expiration in the local timezone then converts to UTC for the RCON comment. See `expiration_time_local = local_time + timedelta(hours=VIP_DURATION_HOURS)`.
-
-## Debugging tips
-- If the bot fails on startup, check the following in order:
-  1. `.env` values — missing `DISCORD_TOKEN` or DB/RCON values cause immediate failures.
-  2. MySQL connection — the process opens a connection at import; confirm credentials and that `mysql-connector-python` is installed.
-  3. RCON connectivity — RCON errors manifest when users request VIP; use logs around `RconError` and the `logging` module.
-- To test UI behavior without a real RCON server: stub `grant_vip()` or monkeypatch `RconClient.add_vip` to return a fake success message. Because `grant_vip` is called via `loop.run_in_executor`, patch the synchronous function used there.
-
-## Small maintenance notes
-- Python version: README suggests Python 3.8+. Keep typing and usage compatible with 3.8+.
-- Dependencies are minimal and listed in `requirements.txt`.
-
-## When changing behavior
-- Preserve the public shapes used by the Discord UI: `grant_vip(player_id, comment) -> str` and `RconError` for failure signaling.
-- Avoid long blocking operations on the async event loop — the code currently offloads RCON calls to a thread executor; keep that pattern for any blocking external calls.
-
-## Footer
-If anything in these notes is unclear or you want more examples (tests, refactor suggestions, or CI actions), tell me which area to expand and I will iterate.
+If you want this shortened further or to include small sample snippets/tests, tell me which area to expand (tests, RCON mock examples, or systemd debugging). 
