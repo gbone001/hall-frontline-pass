@@ -291,6 +291,8 @@ class AppConfig:
     announcement_message_id: Optional[int]
     http_credentials: Optional[HttpCredentials]
     crcon_database_url: Optional[str]
+    vip_temp_role_id: Optional[int]
+    vip_claim_channel_id: Optional[int]
 
     @property
     def vip_duration_label(self) -> str:
@@ -423,6 +425,8 @@ def load_config() -> AppConfig:
     moderation_channel_id = optional_int("MODERATION_CHANNEL_ID")
     moderator_role_id = optional_int("MODERATOR_ROLE_ID")
     announcement_message_id = optional_int("ANNOUNCEMENT_MESSAGE_ID")
+    vip_temp_role_id = optional_int("VIP_TEMP_ROLE_ID")
+    vip_claim_channel_id = optional_int("VIP_CLAIM_CHANNEL_ID")
 
     http_base_url_raw = get_value("CRCON_HTTP_BASE_URL")
     http_bearer_token = get_value("CRCON_HTTP_BEARER_TOKEN")
@@ -494,6 +498,8 @@ def load_config() -> AppConfig:
         announcement_message_id=announcement_message_id,
         http_credentials=http_credentials,
         crcon_database_url=crcon_database_url,
+        vip_temp_role_id=vip_temp_role_id,
+        vip_claim_channel_id=vip_claim_channel_id,
     )
 
 
@@ -1737,6 +1743,8 @@ class CombinedView(PersistentView):
             wait=True,
         )
         schedule_ephemeral_cleanup(interaction, message=followup_message)
+        # If the user had a temporary VIP Discord role for registration/claim, remove it now.
+        await self._maybe_remove_temp_vip_role(interaction)
 
 
     def _refresh_button_label(self) -> None:
@@ -1808,6 +1816,31 @@ class CombinedView(PersistentView):
             schedule_ephemeral_cleanup(interaction)
 
         await self.bot.refresh_announcement_message()
+
+    async def _maybe_remove_temp_vip_role(self, interaction: discord.Interaction) -> None:
+        role_id = getattr(self.config, "vip_temp_role_id", None)
+        if not role_id:
+            return
+        guild = interaction.guild
+        if guild is None:
+            return
+        # interaction.user can be a Member in guild contexts
+        user = interaction.user
+        if not isinstance(user, discord.Member):
+            try:
+                # Try to fetch member if possible
+                user = await guild.fetch_member(interaction.user.id)
+            except discord.DiscordException:
+                return
+        role = guild.get_role(role_id)
+        if role is None:
+            return
+        if role in getattr(user, "roles", []):
+            try:
+                await user.remove_roles(role, reason="Frontline Pass: remove temporary VIP role after claim")
+                logging.info("Removed temporary VIP role %s from %s after claim", role_id, user.id)
+            except discord.DiscordException:
+                logging.exception("Failed to remove temporary VIP role %s from %s", role_id, user.id)
 
 
 def create_database(config: AppConfig) -> Database:
@@ -2171,6 +2204,90 @@ class FrontlinePassBot(commands.Bot):
             )
             await interaction.response.send_message(msg, ephemeral=True)
             schedule_ephemeral_cleanup(interaction)
+
+        @self.tree.command(
+            name="assignvip",
+            description="Assign a temporary VIP Discord role to a member so they can register and claim VIP.",
+        )
+        @app_commands.describe(member="Select the server member to grant temporary VIP role to")
+        async def assignvip(interaction: discord.Interaction, member: discord.Member) -> None:
+            # Permission check
+            if not self._user_has_moderator_privileges(interaction.user):
+                await interaction.response.send_message(
+                    "You need moderator permissions to use this command.",
+                    ephemeral=True,
+                )
+                schedule_ephemeral_cleanup(interaction)
+                return
+
+            role_id = self.config.vip_temp_role_id
+            if not role_id:
+                await interaction.response.send_message(
+                    "VIP_TEMP_ROLE_ID is not configured. Set it in your environment or config.",
+                    ephemeral=True,
+                )
+                schedule_ephemeral_cleanup(interaction)
+                return
+
+            guild = interaction.guild
+            if guild is None:
+                await interaction.response.send_message(
+                    "This command can only be used inside a server (guild).",
+                    ephemeral=True,
+                )
+                schedule_ephemeral_cleanup(interaction)
+                return
+
+            role = guild.get_role(role_id)
+            if role is None:
+                await interaction.response.send_message(
+                    f"Could not find role with ID {role_id} in this server.",
+                    ephemeral=True,
+                )
+                schedule_ephemeral_cleanup(interaction)
+                return
+
+            try:
+                await member.add_roles(role, reason="Frontline Pass: temporary VIP role for registration/claim")
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    "I don't have permission to assign that role. Ensure my role is above the VIP role.",
+                    ephemeral=True,
+                )
+                schedule_ephemeral_cleanup(interaction)
+                return
+            except discord.DiscordException:
+                logging.exception("Failed to add temporary VIP role %s to %s", role_id, member.id)
+                await interaction.response.send_message(
+                    "Failed to assign the temporary VIP role due to an unexpected error.",
+                    ephemeral=True,
+                )
+                schedule_ephemeral_cleanup(interaction)
+                return
+
+            # Optionally post guidance in the VIP claim channel
+            claim_channel_id = self.config.vip_claim_channel_id or self.config.channel_id
+            channel_mention = f"<#{claim_channel_id}>" if claim_channel_id else "the VIP channel"
+            try:
+                await interaction.response.send_message(
+                    (
+                        f"Assigned {role.mention} to {member.mention}.\n"
+                        f"Please go to {channel_mention} and use the Register button (or /register_player), then press Get VIP.\n"
+                        f"After you claim VIP, your temporary Discord role will be removed automatically."
+                    ),
+                    ephemeral=True,
+                )
+                schedule_ephemeral_cleanup(interaction)
+            except discord.InteractionResponded:
+                # Fallback if already responded earlier (shouldn't happen in happy path)
+                with contextlib.suppress(discord.DiscordException):
+                    await interaction.followup.send(
+                        (
+                            f"Assigned {role.mention} to {member.mention}. Go to {channel_mention} to register and claim VIP."
+                        ),
+                        ephemeral=True,
+                        wait=False,
+                    )
 
 
 def create_bot(

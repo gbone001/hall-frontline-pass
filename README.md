@@ -5,6 +5,7 @@ Frontline Pass is a Discord bot that lets Hell Let Loose players link their Disc
 ## Highlights
 
 - **Self-service VIPs** - players register once and press **Get VIP** whenever they need a slot.
+- **Moderator assist: /assignvip** - moderators can grant a temporary Discord role to a member so they can access the VIP channel to register and claim; the role is removed automatically after claiming.
 - **Smart transport** - CRCON HTTP (with automatic login/token refresh) first, RCON fallback second.
 - **Always-on control panel** - the Discord message survives restarts and can be reposted via `/repost_frontline_controls`.
 - **Duplicate protection** - blocks reused T17 IDs and can ping a moderator channel/role.
@@ -69,6 +70,7 @@ All primary settings live in `config.jsonc` (JSON5 syntax). Environment variable
 | `DATABASE_TABLE` | Optional | Legacy option kept for backwards compatibility; ignored by the JSON backend. |
 | `ANNOUNCEMENT_MESSAGE_ID` | Optional | Reuse an existing Discord message for the control panel. |
 | `MODERATION_CHANNEL_ID`, `MODERATOR_ROLE_ID` | Optional | Where (and who) to ping when duplicate T17 IDs are detected. |
+| `VIP_TEMP_ROLE_ID`, `VIP_CLAIM_CHANNEL_ID` | Optional | Used by `/assignvip`. `VIP_TEMP_ROLE_ID` is a temporary Discord role that grants access to your VIP claim channel. `VIP_CLAIM_CHANNEL_ID` is the channel ID where the control panel lives (falls back to `CHANNEL_ID` if unset). |
 | `COMMAND_GUILD_IDS` / `COMMAND_GUILD_ID` | Optional | Comma-separated guild IDs (or a single ID) to sync slash commands instantly to those servers. If unset, commands are synced globally (may take up to ~1 hour to propagate). |
 | `CRCON_HTTP_BASE_URL` | Optional | CRCON host (omit `/api`; the bot appends it automatically). |
 | `CRCON_HTTP_BEARER_TOKEN` | Optional | Pre-generated CRCON token. |
@@ -115,6 +117,13 @@ The bot validates required settings on startup and exits with a clear error when
 2. **Get VIP** - clicking **Get VIP** looks up the user's Discord ID. If a T17 ID is linked, the bot grants VIP via CRCON/RCON and reports the expiry. If not, it reminds the user to register first.
 
 Admins can refresh the message at any time with `/repost_frontline_controls`.
+
+### New: Moderator flow with `/assignvip`
+
+1. A moderator runs `/assignvip` and selects a member from the server-wide autocomplete picker.
+2. The bot assigns the `VIP_TEMP_ROLE_ID` role to that member and points them to `VIP_CLAIM_CHANNEL_ID` (or `CHANNEL_ID`).
+3. The member registers (if not already) and presses **Get VIP**.
+4. After a successful claim, the bot automatically removes the temporary Discord role so access reverts to normal.
 
 ## Deployment Notes
 
