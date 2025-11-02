@@ -28,7 +28,7 @@ try:
 except ImportError:  # discord.py>=2.4 renamed MessageableChannel -> Messageable
     from discord.abc import Messageable as MessageableChannel
 from discord.ext import commands
-from discord.ui import Button, Modal, TextInput, View, UserSelect
+from discord.ui import Button, Modal, TextInput, View
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -1561,30 +1561,10 @@ class VipGrantResult:
     detail: str
 
 
-class MemberLookupSelect(UserSelect):
-    def __init__(self, parent_view: "CombinedView") -> None:
-        super().__init__(
-            placeholder="Search for your Discord name",
-            min_values=1,
-            max_values=1,
-            custom_id="frontline-pass-member-select",
-        )
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        member = self.values[0] if self.values else None
-        display_name = None
-        if member is not None:
-            display_name = getattr(member, "display_name", None) or getattr(member, "name", None)
-        modal = PlayerIDModal(self.parent_view, default_player_name=display_name)
-        await interaction.response.send_modal(modal)
-
-
 class ManualEntryPromptView(View):
     def __init__(self, parent_view: "CombinedView") -> None:
         super().__init__(timeout=120)
         self.parent_view = parent_view
-        self.add_item(MemberLookupSelect(parent_view))
         self.add_item(ManualEntryPromptButton(parent_view))
 
     async def on_timeout(self) -> None:
@@ -1603,10 +1583,59 @@ class ManualEntryPromptButton(Button):
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        default_name = getattr(interaction.user, "display_name", None)
-        await interaction.response.send_modal(
-            PlayerIDModal(self.parent_view, default_player_name=default_name)
+        await interaction.response.send_modal(PlayerIDModal(self.parent_view))
+
+
+class PlayerSearchModal(Modal):
+    def __init__(self, parent_view: "CombinedView") -> None:
+        super().__init__(title="Find your player", custom_id="frontline-pass-player-search-modal")
+        self._parent_view = parent_view
+        self.player_query = TextInput(
+            label="Player name or T17 / Steam ID",
+            placeholder="Start typing your player name or ID",
+            custom_id="frontline-pass-player-search-input",
+            min_length=2,
+            max_length=100,
         )
+        self.add_item(self.player_query)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        search_text = self.player_query.value.strip()
+        if not search_text:
+            await interaction.response.send_message(
+                "Search text cannot be empty. Try again.",
+                ephemeral=True,
+            )
+            _schedule_ephemeral_cleanup(interaction)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        candidates = await asyncio.to_thread(
+            self._parent_view.bot.find_player_candidates,
+            search_text,
+            limit=25,
+        )
+
+        parent_view = self._parent_view
+        if not candidates:
+            view = ManualEntryPromptView(parent_view)
+            message = await interaction.followup.send(
+                "No matching players found. Use the button below to enter your T17 / Steam ID manually.",
+                view=view,
+                ephemeral=True,
+                wait=True,
+            )
+            _schedule_ephemeral_cleanup(interaction, message=message)
+            return
+
+        selection_view = PlayerSelectionView(parent_view, candidates)
+        message = await interaction.followup.send(
+            "Select your player from the list, or choose manual entry if you can't find it.",
+            view=selection_view,
+            ephemeral=True,
+            wait=True,
+        )
+        _schedule_ephemeral_cleanup(interaction, message=message)
 
 
 class PlayerSelectionView(View):
@@ -1651,36 +1680,24 @@ class PlayerSelectionView(View):
         self.stop()
 
 class PlayerIDModal(Modal):
-    def __init__(self, parent_view: "CombinedView", *, default_player_name: Optional[str] = None):
-        super().__init__(title="Please input Player-ID", custom_id="frontline-pass-player-id-modal")
+    def __init__(self, parent_view: "CombinedView"):
+        super().__init__(title="Enter your T17 / Steam ID", custom_id="frontline-pass-player-id-modal")
         self._parent_view = parent_view
         self.database = parent_view.database
         self.notifier = parent_view.notifier
-        self.player_name = TextInput(
-            label="Confirm your Discord display name (optional)",
-            default=(default_player_name or ""),
-            placeholder="Start typing to adjust your Discord name if needed",
-            required=False,
-            max_length=100,
-            custom_id="frontline-pass-player-name-input",
-        )
         self.player_id = TextInput(
             label="T17 / Steam ID",
             placeholder="12345678901234567",
             custom_id="frontline-pass-player-id-input",
         )
-        self.add_item(self.player_name)
         self.add_item(self.player_id)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         steam_id = self.player_id.value
-        supplied_name = self.player_name.value.strip() if self.player_name.value else ""
-        lookup_name = self._parent_view.bot.lookup_player_name(steam_id.strip())
-        resolved_name = supplied_name or lookup_name
         await self._parent_view.complete_registration(
             interaction,
             steam_id,
-            player_name=resolved_name,
+            player_name=self._parent_view.bot.lookup_player_name(steam_id.strip()),
         )
 
 
@@ -1722,28 +1739,7 @@ class CombinedView(PersistentView):
                 _schedule_ephemeral_cleanup(interaction)
                 return
 
-            view = ManualEntryPromptView(self)
-            if getattr(self.bot, "player_directory", None):
-                try:
-                    command = interaction.client.tree.get_command("register_player")
-                except Exception:
-                    command = None
-                command_mention = getattr(command, "mention", "/register_player")
-                prompt = (
-                    f"Pick your Discord name below to prefill your details, "
-                    f"or use {command_mention} for the full player directory search."
-                )
-            else:
-                prompt = (
-                    "Pick your Discord name below, then enter your T17 / Steam ID to finish registration."
-                )
-
-            await interaction.response.send_message(
-                prompt,
-                view=view,
-                ephemeral=True,
-            )
-            _schedule_ephemeral_cleanup(interaction)
+            await interaction.response.send_modal(PlayerSearchModal(self))
             return
 
         except Exception:
