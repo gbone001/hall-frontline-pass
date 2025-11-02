@@ -28,7 +28,7 @@ try:
 except ImportError:  # discord.py>=2.4 renamed MessageableChannel -> Messageable
     from discord.abc import Messageable as MessageableChannel
 from discord.ext import commands
-from discord.ui import Button, Modal, TextInput, View
+from discord.ui import Modal, TextInput, View
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -79,7 +79,7 @@ def schedule_ephemeral_cleanup(
 
 class DuplicateSteamIDError(Exception):
     def __init__(self, steam_id: str, existing_discord_id: Optional[str]) -> None:
-        super().__init__(f"Player-ID {steam_id} already registered.")
+        super().__init__(f"T17 profile {steam_id} already registered.")
         self.steam_id = steam_id
         self.existing_discord_id = existing_discord_id
 
@@ -101,7 +101,7 @@ def build_announcement_embed(config: AppConfig, database: "Database", vip_durati
     embed = discord.Embed(
         title=ANNOUNCEMENT_TITLE,
         description=(
-            "Use the buttons below to register your Player-ID and request VIP access.\n"
+            "Use the buttons below to register your T17 profile and request VIP access.\n"
             f"VIP duration: **{vip_duration_hours:g} hours**.\n"
             "Registration is required once; future VIP requests are instant."
         ),
@@ -1207,7 +1207,7 @@ class ModeratorNotifier:
 
     async def notify_duplicate(self, interaction: discord.Interaction, steam_id: str, existing_discord_id: Optional[str]) -> None:
         if not self._channel_id:
-            logging.info("Duplicate Player-ID detected but MODERATION_CHANNEL_ID is not configured.")
+            logging.info("Duplicate T17 profile detected but MODERATION_CHANNEL_ID is not configured.")
             return
 
         channel = interaction.client.get_channel(self._channel_id)
@@ -1227,15 +1227,15 @@ class ModeratorNotifier:
         existing_mention = f"<@{existing_discord_id}>" if existing_discord_id else "an unknown user"
 
         content = (
-            f"{role_mention} Duplicate Player-ID attempt detected.\n"
-            f"Player-ID `{steam_id}` is already associated with {existing_mention}. "
+            f"{role_mention} Duplicate T17 profile attempt detected.\n"
+            f"T17 ID `{steam_id}` is already associated with {existing_mention}. "
             f"Attempted by {interaction.user.mention}."
         ).strip()
 
         try:
             await channel.send(content)
         except discord.DiscordException:
-            logging.exception("Failed to notify moderators about duplicate Player-ID %s", steam_id)
+            logging.exception("Failed to notify moderators about duplicate T17 profile %s", steam_id)
 
 
 class VipHTTPError(Exception):
@@ -1561,38 +1561,13 @@ class VipGrantResult:
     detail: str
 
 
-class ManualEntryPromptView(View):
-    def __init__(self, parent_view: "CombinedView") -> None:
-        super().__init__(timeout=120)
-        self.parent_view = parent_view
-        self.add_item(ManualEntryPromptButton(parent_view))
-
-    async def on_timeout(self) -> None:
-        for item in self.children:
-            with contextlib.suppress(Exception):
-                item.disabled = True
-
-
-class ManualEntryPromptButton(Button):
-    def __init__(self, parent_view: "CombinedView") -> None:
-        super().__init__(
-            label="Enter ID manually",
-            style=ButtonStyle.secondary,
-            custom_id="frontline-pass-manual-entry",
-        )
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_modal(PlayerIDModal(self.parent_view))
-
-
 class PlayerSearchModal(Modal):
     def __init__(self, parent_view: "CombinedView") -> None:
         super().__init__(title="Find your player", custom_id="frontline-pass-player-search-modal")
         self._parent_view = parent_view
         self.player_query = TextInput(
-            label="Player name or T17 / Steam ID",
-            placeholder="Start typing your player name or ID",
+            label="T17 name",
+            placeholder="Start typing your in-game name",
             custom_id="frontline-pass-player-search-input",
             min_length=2,
             max_length=100,
@@ -1616,21 +1591,18 @@ class PlayerSearchModal(Modal):
             limit=25,
         )
 
-        parent_view = self._parent_view
         if not candidates:
-            view = ManualEntryPromptView(parent_view)
             message = await interaction.followup.send(
-                "No matching players found. Use the button below to enter your T17 / Steam ID manually.",
-                view=view,
+                "No matching players were found. Double-check the spelling or try a different part of the name.",
                 ephemeral=True,
                 wait=True,
             )
             _schedule_ephemeral_cleanup(interaction, message=message)
             return
 
-        selection_view = PlayerSelectionView(parent_view, candidates)
+        selection_view = PlayerSelectionView(self._parent_view, candidates)
         message = await interaction.followup.send(
-            "Select your player from the list, or choose manual entry if you can't find it.",
+            "Select your player from the list below.",
             view=selection_view,
             ephemeral=True,
             wait=True,
@@ -1664,7 +1636,6 @@ class PlayerSelectionView(View):
         )
         self._select.callback = self._on_select
         self.add_item(self._select)
-        self.add_item(ManualEntryPromptButton(parent_view))
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
         value = self._select.values[0]
@@ -1678,28 +1649,6 @@ class PlayerSelectionView(View):
             if interaction.message:
                 await interaction.message.edit(content="Registration complete.", view=None)
         self.stop()
-
-class PlayerIDModal(Modal):
-    def __init__(self, parent_view: "CombinedView"):
-        super().__init__(title="Enter your T17 / Steam ID", custom_id="frontline-pass-player-id-modal")
-        self._parent_view = parent_view
-        self.database = parent_view.database
-        self.notifier = parent_view.notifier
-        self.player_id = TextInput(
-            label="T17 / Steam ID",
-            placeholder="12345678901234567",
-            custom_id="frontline-pass-player-id-input",
-        )
-        self.add_item(self.player_id)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        steam_id = self.player_id.value
-        await self._parent_view.complete_registration(
-            interaction,
-            steam_id,
-            player_name=self._parent_view.bot.lookup_player_name(steam_id.strip()),
-        )
-
 
 class PersistentView(View):
     def __init__(self) -> None:
@@ -1731,11 +1680,11 @@ class CombinedView(PersistentView):
             existing = self.database.fetch_player(discord_id)
             if existing:
                 stored_name = self.database.fetch_player_name(discord_id)
-                display = f"{existing} ({stored_name})" if stored_name else existing
-                await interaction.response.send_message(
-                    f"You're already registered. Your T17 ID `{display}` is linked to your Discord account.",
-                    ephemeral=True,
-                )
+                if stored_name:
+                    message = f"You're already registered as **{stored_name}**."
+                else:
+                    message = "You're already registered."
+                await interaction.response.send_message(message, ephemeral=True)
                 _schedule_ephemeral_cleanup(interaction)
                 return
 
@@ -1763,14 +1712,14 @@ class CombinedView(PersistentView):
 
     @discord.ui.button(label="Get VIP", style=ButtonStyle.success, custom_id="frontline-pass-get-vip")
     async def get_vip_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        """Grant VIP to the invoking user based on their registered Player-ID."""
+        """Grant VIP to the invoking user based on their registered T17 profile."""
         await interaction.response.defer(ephemeral=True)
 
         discord_id = str(interaction.user.id)
         steam_id = await asyncio.to_thread(self.database.fetch_player, discord_id)
         if not steam_id:
             followup = await interaction.followup.send(
-                "You haven't registered a Player-ID yet. Use the Register button or /register_player first.",
+                "You haven't registered a T17 profile yet. Use the Register button or /register_player first.",
                 ephemeral=True,
                 wait=True,
             )
@@ -1811,9 +1760,11 @@ class CombinedView(PersistentView):
         now_utc = datetime.now(timezone.utc)
         await asyncio.to_thread(self.database.set_metadata, LAST_GRANT_METADATA_KEY, now_utc.isoformat())
 
-        message_lines = [f"VIP granted to `{steam_id}`."]
         if player_name:
-            message_lines[0] += f" ({player_name})"
+            message_lines = [f"VIP granted to **{player_name}**."]
+        else:
+            message_lines = [f"VIP granted."]
+            message_lines.append(f"T17 ID: `{steam_id}`")
         if expiry_text:
             message_lines.append(f"Expires at {expiry_text}.")
         message_lines.extend(result.status_lines or [])
@@ -1851,19 +1802,19 @@ class CombinedView(PersistentView):
         *,
         player_name: Optional[str] = None,
     ) -> None:
-        """Persist the provided Player-ID for the invoking Discord user."""
+        """Persist the provided T17 profile for the invoking Discord user."""
         discord_id = str(interaction.user.id)
         sanitized = str(steam_id or "").strip().replace(" ", "")
         if not sanitized:
             await self._send_registration_response(
                 interaction,
-                "Player-ID cannot be empty. Please try again.",
+                "That selection did not include a valid T17 profile. Please try again.",
             )
             return
         if not sanitized.isdigit():
             await self._send_registration_response(
                 interaction,
-                "Player-ID must contain digits only.",
+                "That selection did not include a valid T17 profile. Please try again.",
             )
             return
 
@@ -1878,11 +1829,11 @@ class CombinedView(PersistentView):
             await self.notifier.notify_duplicate(interaction, sanitized, exc.existing_discord_id)
             await self._send_registration_response(
                 interaction,
-                "That Player-ID is already linked to another Discord account. Contact a moderator if this seems wrong.",
+                "That T17 profile is already linked to another Discord account. Contact a moderator if this seems wrong.",
             )
             return
         except Exception:
-            logging.exception("Failed to register Player-ID %s for %s", sanitized, discord_id)
+            logging.exception("Failed to register T17 profile %s for %s", sanitized, discord_id)
             await self._send_registration_response(
                 interaction,
                 "Registration failed due to an internal error. Moderators have been notified.",
@@ -1893,9 +1844,10 @@ class CombinedView(PersistentView):
         if cached_name:
             self.bot._autocomplete_cache[sanitized] = cached_name
 
-        message = f"Linked Player-ID `{sanitized}` to your Discord account."
         if cached_name:
-            message += f" Last seen name: **{cached_name}**."
+            message = f"Linked **{cached_name}** to your Discord account."
+        else:
+            message = "Linked your T17 profile to your Discord account."
         await self._send_registration_response(interaction, message)
 
     async def _send_registration_response(
@@ -2098,9 +2050,9 @@ class FrontlinePassBot(commands.Bot):
     async def _register_commands(self) -> None:
         @self.tree.command(
             name="register_player",
-            description="Search for your player name and link your T17 ID.",
+            description="Search for your T17 name and link it to your Discord account.",
         )
-        @app_commands.describe(player="Start typing a player name or T17 ID")
+        @app_commands.describe(player="Start typing your T17 name")
         async def register_player(interaction: discord.Interaction, player: str) -> None:
             if not self.persistent_view:
                 await interaction.response.send_message(
@@ -2130,10 +2082,8 @@ class FrontlinePassBot(commands.Bot):
 
             parent_view = self.persistent_view
             if not candidates:
-                view = ManualEntryPromptView(parent_view) if parent_view else None
                 followup = await interaction.followup.send(
-                    "No matching players found. Use the button below to enter your T17 ID manually.",
-                    view=view,
+                    "No matching players found. Double-check the spelling or try a different part of the name.",
                     ephemeral=True,
                     wait=True,
                 )
@@ -2142,7 +2092,7 @@ class FrontlinePassBot(commands.Bot):
 
             selection_view = PlayerSelectionView(parent_view, candidates) if parent_view else None
             followup = await interaction.followup.send(
-                "Select your player from the list below (or choose manual entry).",
+                "Select your player from the list below.",
                 view=selection_view,
                 ephemeral=True,
                 wait=True,
