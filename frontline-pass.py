@@ -1162,6 +1162,7 @@ class VipService:
         if not prefix:
             return []
         results: List[Tuple[str, str]] = []
+        filter_term = prefix.lower()
         if self._player_directory:
             try:
                 results.extend(self._player_directory.search_players(prefix, limit=limit))
@@ -1179,6 +1180,16 @@ class VipService:
         seen: Set[str] = set()
         deduped: List[Tuple[str, str]] = []
         for player_id, name in results:
+            try:
+                pid_lower = player_id.lower()
+            except AttributeError:
+                pid_lower = ""
+            try:
+                name_lower = name.lower()
+            except AttributeError:
+                name_lower = ""
+            if filter_term and filter_term not in pid_lower and filter_term not in name_lower:
+                continue
             key = f"{player_id}:{name}"
             if key in seen:
                 continue
