@@ -1,8 +1,5 @@
-import gc
 import importlib.util
 import pathlib
-import sqlite3
-import tempfile
 import unittest
 from unittest import mock
 
@@ -22,7 +19,6 @@ HttpCredentials = frontline_pass.HttpCredentials
 VipHttpClient = frontline_pass.VipHttpClient
 VipHTTPError = frontline_pass.VipHTTPError
 VipService = frontline_pass.VipService
-Database = frontline_pass.Database
 
 
 class DummyResponse:
@@ -187,17 +183,14 @@ class VipServiceTests(unittest.TestCase):
             channel_id=1,
             timezone=pytz.UTC,
             timezone_name="UTC",
-            database_path=":memory:",
-            database_table="vip_players",
             http_credentials=HttpCredentials(
-                base_url="https://example/api",
+                base_url="https://example",
                 bearer_token="abc123",
             ),
-            crcon_database_url=None,
         )
 
     def test_grant_vip_uses_http_client(self) -> None:
-        service = VipService(self.config, None)
+        service = VipService(self.config)
         fake_http_client = mock.Mock()
         fake_http_client.add_vip.return_value = {"result": "ok"}
         service._http_client = fake_http_client  # type: ignore[attr-defined]
@@ -210,116 +203,17 @@ class VipServiceTests(unittest.TestCase):
         self.assertIsNone(kwargs.get("player_name"))
         self.assertIn("HTTP API", result.status_lines[0])
 
-    def test_passes_player_name_when_directory_available(self) -> None:
-        directory = mock.Mock()
-        directory.lookup_player_name.return_value = "GBONE001"
-        service = VipService(self.config, directory)
+    def test_grant_vip_forwards_player_name(self) -> None:
+        service = VipService(self.config)
         fake_http_client = mock.Mock()
         fake_http_client.add_vip.return_value = {"result": "ok"}
         service._http_client = fake_http_client  # type: ignore[attr-defined]
-        service._grant_vip_via_rcon = mock.Mock()  # type: ignore[attr-defined]
 
-        service.grant_vip("steam123", "comment", None)
+        service.grant_vip("steam123", "comment", None, player_name="GBONE001")
 
-        directory.lookup_player_name.assert_called_once_with("steam123")
         fake_http_client.add_vip.assert_called_once()
         _, kwargs = fake_http_client.add_vip.call_args
         self.assertEqual(kwargs.get("player_name"), "GBONE001")
-
-
-class DatabaseTests(unittest.TestCase):
-    def test_uses_legacy_sqlite_backend(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_path = pathlib.Path(tmpdir) / "legacy.db"
-            connection = sqlite3.connect(db_path)
-            try:
-                connection.execute(
-                    """
-                    CREATE TABLE vip_players (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        discord_id TEXT UNIQUE NOT NULL,
-                        steam_id TEXT UNIQUE NOT NULL
-                    )
-                    """
-                )
-                connection.execute(
-                    'INSERT INTO vip_players (discord_id, steam_id) VALUES (?, ?)',
-                    ("123456", "7654321"),
-                )
-                connection.execute(
-                    """
-                    CREATE TABLE metadata (
-                        key TEXT PRIMARY KEY,
-                        value TEXT
-                    )
-                    """
-                )
-                connection.execute(
-                    'INSERT INTO metadata (key, value) VALUES (?, ?)',
-                    ("vip_duration_hours", "4"),
-                )
-                connection.commit()
-            finally:
-                connection.close()
-
-            database = Database(str(db_path), "vip_players")
-
-            self.assertEqual(database.fetch_player("123456"), "7654321")
-            self.assertEqual(database.get_metadata("vip_duration_hours"), "4")
-            self.assertEqual(database.count_players(), 1)
-
-            database.upsert_player("654321", "999888777")
-            database.set_metadata("announcement_message_id", "42")
-            self.assertEqual(database.fetch_player("654321"), "999888777")
-            self.assertEqual(database.get_metadata("announcement_message_id"), "42")
-            self.assertEqual(database.count_players(), 2)
-
-            # Re-open to ensure persistence
-            database = None
-            reopened = Database(str(db_path), "vip_players")
-            self.assertEqual(reopened.fetch_player("654321"), "999888777")
-            self.assertEqual(reopened.get_metadata("announcement_message_id"), "42")
-            self.assertEqual(reopened.count_players(), 2)
-            reopened = None
-            gc.collect()
-
-            with open(db_path, "rb") as handle:
-                header = handle.read(16)
-            self.assertTrue(header.startswith(b"SQLite format 3"))
-
-
-class PlayerDirectoryTests(unittest.TestCase):
-    def test_lookup_player_name_returns_latest(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_path = pathlib.Path(tmpdir) / "players.db"
-            connection = sqlite3.connect(db_path)
-            try:
-                connection.execute(
-                    """
-                    CREATE TABLE player_names (
-                        playersteamid_id TEXT,
-                        name TEXT,
-                        last_seen TIMESTAMP
-                    )
-                    """
-                )
-                connection.execute(
-                    "INSERT INTO player_names (playersteamid_id, name, last_seen) VALUES (?, ?, ?)",
-                    ("111", "OlderName", "2024-01-01 00:00:00"),
-                )
-                connection.execute(
-                    "INSERT INTO player_names (playersteamid_id, name, last_seen) VALUES (?, ?, ?)",
-                    ("111", "LatestName", "2025-01-01 00:00:00"),
-                )
-                connection.commit()
-            finally:
-                connection.close()
-
-            directory = frontline_pass.PlayerDirectory(f"sqlite:///{db_path}")
-            try:
-                self.assertEqual(directory.lookup_player_name("111"), "LatestName")
-            finally:
-                directory._engine.dispose()
 
 
 if __name__ == "__main__":
