@@ -732,7 +732,6 @@ class CombinedView(PersistentView):
             schedule_ephemeral_cleanup(interaction)
             return
 
-        steam_id = steam_id.lower()
         if len(steam_id) != 32:
             await interaction.response.send_message(
                 "Player-ID must be a 32-character string copied from https://hllrecords.com.",
@@ -742,9 +741,19 @@ class CombinedView(PersistentView):
             return
 
         await interaction.response.defer(ephemeral=True)
-        await self._grant_vip_for_player(interaction, steam_id)
+        await self._grant_vip_for_player(
+            interaction,
+            steam_id,
+            player_display_name=interaction.user.display_name,
+        )
 
-    async def _grant_vip_for_player(self, interaction: discord.Interaction, steam_id: str) -> None:
+    async def _grant_vip_for_player(
+        self,
+        interaction: discord.Interaction,
+        steam_id: str,
+        *,
+        player_display_name: Optional[str] = None,
+    ) -> None:
         duration_hours = self.bot.vip_duration_hours
         local_time = datetime.now(self.config.timezone)
         expiration_time_local = local_time + timedelta(hours=duration_hours)
@@ -760,6 +769,7 @@ class CombinedView(PersistentView):
                 steam_id,
                 comment,
                 expiration_time_iso,
+                player_name=player_display_name,
             )
         except VipHTTPError as exc:
             logging.exception("Failed to grant VIP for player %s", steam_id)
