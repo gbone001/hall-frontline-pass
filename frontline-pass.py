@@ -1532,72 +1532,6 @@ class VipGrantResult:
     detail: str
 
 
-class ManualEntryPromptView(View):
-    def __init__(self, parent_view: "CombinedView") -> None:
-        super().__init__(timeout=60)
-        self.parent_view = parent_view
-        self.add_item(ManualEntryPromptButton(parent_view))
-
-    async def on_timeout(self) -> None:
-        for item in self.children:
-            with contextlib.suppress(Exception):
-                item.disabled = True
-
-
-class ManualEntryPromptButton(Button):
-    def __init__(self, parent_view: "CombinedView") -> None:
-        super().__init__(
-            label="Enter ID manually",
-            style=ButtonStyle.secondary,
-            custom_id="frontline-pass-manual-entry",
-        )
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_modal(PlayerIDModal(self.parent_view))
-
-
-class PlayerSelectionView(View):
-    def __init__(self, parent_view: "CombinedView", options: List[Tuple[str, str]]) -> None:
-        super().__init__(timeout=60)
-        self.parent_view = parent_view
-        self._lookup: Dict[str, str] = {}
-        select_options = []
-        for player_id, name in options:
-            sanitized_id = player_id.strip()
-            if not sanitized_id:
-                continue
-            display_name = name[:100] if name else sanitized_id
-            select_options.append(
-                discord.SelectOption(
-                    label=display_name,
-                    value=sanitized_id,
-                )
-            )
-            self._lookup[sanitized_id] = display_name
-        self._select = discord.ui.Select(
-            placeholder="Select a player",
-            options=select_options,
-            min_values=1,
-            max_values=1,
-        )
-        self._select.callback = self._on_select
-        self.add_item(self._select)
-        self.add_item(ManualEntryPromptButton(parent_view))
-
-    async def _on_select(self, interaction: discord.Interaction) -> None:
-        value = self._select.values[0]
-        display_name = self._lookup.get(value, value)
-        await self.parent_view.complete_registration(
-            interaction,
-            value,
-            player_name=display_name,
-        )
-        with contextlib.suppress(discord.HTTPException):
-            if interaction.message:
-                await interaction.message.edit(content="Registration complete.", view=None)
-        self.stop()
-
 class PlayerIDModal(Modal):
     def __init__(self, parent_view: "CombinedView"):
         super().__init__(title="Please input Player-ID", custom_id="frontline-pass-player-id-modal")
@@ -1653,19 +1587,6 @@ class CombinedView(PersistentView):
                 f"You're already registered. Your T17 ID `{display}` is linked to your Discord account.",
                 ephemeral=True,
             )
-            schedule_ephemeral_cleanup(interaction)
-            return
-
-        if self.bot.player_directory:
-            command = interaction.client.tree.get_command("register_player") if hasattr(interaction.client, "tree") else None
-            command_mention = command.mention if command else "/register_player"
-            view = ManualEntryPromptView(self)
-            message = (
-                f"Use {command_mention} and start typing to search for your player. "
-                "Select the correct entry to link your Discord account.\n"
-                "Can't find it? Click the button below to enter your T17 ID manually."
-            )
-            await interaction.response.send_message(message, view=view, ephemeral=True)
             schedule_ephemeral_cleanup(interaction)
             return
 
@@ -1887,47 +1808,6 @@ class FrontlinePassBot(commands.Bot):
             return []
         return self.player_directory.search_players(prefix, limit=limit)
 
-    def find_player_candidates(self, prefix: str, *, limit: int = 20) -> List[Tuple[str, str]]:
-        combined: List[Tuple[str, str]] = []
-        remaining = limit
-        if self.player_directory and remaining > 0:
-            try:
-                results = self.player_directory.search_players(prefix, limit=remaining)
-                combined.extend(results)
-                remaining = max(0, limit - len(combined))
-            except Exception:
-                logging.exception("PlayerDirectory search failed for prefix %s", prefix)
-
-        if remaining > 0:
-            registered = self.database.search_registered_players(prefix, limit=remaining)
-            for steam_id, name in registered:
-                if not isinstance(steam_id, str) or not steam_id:
-                    continue
-                combined.append((steam_id, name or steam_id))
-                remaining = max(0, limit - len(combined))
-                if remaining <= 0:
-                    break
-
-        if remaining > 0:
-            try:
-                http_results = self.vip_service.search_players(prefix, limit=remaining)
-                combined.extend(http_results)
-            except Exception:
-                logging.exception("HTTP search failed for prefix %s", prefix)
-
-        deduped: List[Tuple[str, str]] = []
-        seen: Set[str] = set()
-        for player_id, name in combined:
-            key = f"{player_id}:{name}"
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append((player_id, name))
-            self._autocomplete_cache[player_id] = name
-            if len(deduped) >= limit:
-                break
-        return deduped
-
     async def setup_hook(self) -> None:
         self.persistent_view = CombinedView(self, self.config, self.database, self.vip_service, self.notifier)
         self.add_view(self.persistent_view)
@@ -2019,11 +1899,11 @@ class FrontlinePassBot(commands.Bot):
     async def _register_commands(self) -> None:
         @self.tree.command(
             name="register_player",
-            description="Search for your player name and link your T17 ID.",
+            description="Link your T17 ID to your Discord account.",
         )
-        @app_commands.describe(player="Start typing a player name or T17 ID")
-        async def register_player(interaction: discord.Interaction, player: str) -> None:
-            if not self.persistent_view:
+        async def register_player(interaction: discord.Interaction) -> None:
+            parent_view = self.persistent_view
+            if not parent_view:
                 await interaction.response.send_message(
                     "The registration system is not ready yet. Please try again shortly.",
                     ephemeral=True,
@@ -2031,44 +1911,19 @@ class FrontlinePassBot(commands.Bot):
                 schedule_ephemeral_cleanup(interaction)
                 return
 
-            await interaction.response.defer(ephemeral=True)
-
-            trimmed = player.strip()
-            if not trimmed:
-                followup = await interaction.followup.send(
-                    "Search text cannot be empty.",
+            discord_id = str(interaction.user.id)
+            existing = parent_view.database.fetch_player(discord_id)
+            if existing:
+                stored_name = parent_view.database.fetch_player_name(discord_id)
+                display = f"{existing} ({stored_name})" if stored_name else existing
+                await interaction.response.send_message(
+                    f"You're already registered. Your T17 ID `{display}` is linked to your Discord account.",
                     ephemeral=True,
-                    wait=True,
                 )
-                schedule_ephemeral_cleanup(interaction, message=followup)
+                schedule_ephemeral_cleanup(interaction)
                 return
 
-            candidates = await asyncio.to_thread(
-                self.find_player_candidates,
-                trimmed,
-                limit=25,
-            )
-
-            parent_view = self.persistent_view
-            if not candidates:
-                view = ManualEntryPromptView(parent_view) if parent_view else None
-                followup = await interaction.followup.send(
-                    "No matching players found. Use the button below to enter your T17 ID manually.",
-                    view=view,
-                    ephemeral=True,
-                    wait=True,
-                )
-                schedule_ephemeral_cleanup(interaction, message=followup)
-                return
-
-            selection_view = PlayerSelectionView(parent_view, candidates) if parent_view else None
-            followup = await interaction.followup.send(
-                "Select your player from the list below (or choose manual entry).",
-                view=selection_view,
-                ephemeral=True,
-                wait=True,
-            )
-            schedule_ephemeral_cleanup(interaction, message=followup)
+            await interaction.response.send_modal(PlayerIDModal(parent_view))
 
         @self.tree.command(
             name="repost_frontline_controls",
