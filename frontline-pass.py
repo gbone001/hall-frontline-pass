@@ -52,14 +52,8 @@ def schedule_ephemeral_cleanup(
 def build_announcement_embed(
     config: AppConfig,
     vip_duration_hours: float,
-    last_grant_at: Optional[datetime],
+    _last_grant_at: Optional[datetime],
 ) -> discord.Embed:
-    if last_grant_at:
-        local_dt = last_grant_at.astimezone(config.timezone)
-        last_grant_text = local_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
-    else:
-        last_grant_text = "No VIP grants yet."
-
     description_lines = [
         "Use the button below to activate your VIP access.",
         'When registering you need to add your player_id number string i.e. "2805d5bbe14b6ec432f82e5cb859d012" from https://hllrecords.com.',
@@ -71,7 +65,6 @@ def build_announcement_embed(
         color=0x2F3136,
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Last VIP Grant", value=last_grant_text, inline=True)
     embed.add_field(name="Local Timezone", value=config.timezone_name, inline=True)
     embed.set_footer(text="Buttons stay active across restarts.")
     return embed
