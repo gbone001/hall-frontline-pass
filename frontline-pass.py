@@ -40,6 +40,11 @@ ANNOUNCEMENT_TITLE = "VIP Control Center"
 ANNOUNCEMENT_METADATA_KEY = "announcement_message_id"
 LAST_GRANT_METADATA_KEY = "last_vip_grant"
 VIP_DURATION_METADATA_KEY = "vip_duration_hours"
+PLAYER_ID_PLACEHOLDER = (
+    "Link your HLL player-id# to your discord account to get the VIP pass. "
+    "Go to https://hllrecords.com/ - and search for your player name. "
+    "Open up your player details and copy the Xbox Game Pass / Epic Games string of numbers into the box below."
+)
 
 
 def schedule_ephemeral_cleanup(
@@ -83,9 +88,9 @@ def build_announcement_embed(config: AppConfig, database: "Database", vip_durati
     embed = discord.Embed(
         title=ANNOUNCEMENT_TITLE,
         description=(
-            "Use the buttons below to register your Player-ID and request VIP access.\n"
+            "Use the button below to request VIP access.\n"
             f"VIP duration: **{vip_duration_hours:g} hours**.\n"
-            "Registration is required once; future VIP requests are instant."
+            "Enter your Player-ID when prompted; it will be remembered for future requests."
         ),
         color=0x2F3136,
         timestamp=datetime.now(timezone.utc),
@@ -1548,11 +1553,7 @@ class PlayerIDModal(Modal):
         self.notifier = parent_view.notifier
         self.player_id = TextInput(
             label="T17 / Steam ID",
-            placeholder=(
-                "Link your HLL player-id# to your discord account to get the VIP pass. "
-                "Go to https://hllrecords.com/ - and search for your player name. "
-                "Open up your player details and copy the Xbox Game Pass / Epic Games string of numbers into the box below."
-            ),
+            placeholder=PLAYER_ID_PLACEHOLDER,
             custom_id="frontline-pass-player-id-input",
         )
         self.add_item(self.player_id)
@@ -1564,6 +1565,22 @@ class PlayerIDModal(Modal):
             steam_id,
             player_name=self._parent_view.bot.lookup_player_name(steam_id.strip()),
         )
+
+
+class VipRequestModal(Modal):
+    def __init__(self, parent_view: "CombinedView", *, default_player_id: Optional[str] = None):
+        super().__init__(title="Request VIP Access", custom_id="frontline-pass-vip-modal")
+        self._parent_view = parent_view
+        self.player_id = TextInput(
+            label="T17 / Steam ID",
+            placeholder=PLAYER_ID_PLACEHOLDER,
+            default=default_player_id,
+            custom_id="frontline-pass-vip-player-id-input",
+        )
+        self.add_item(self.player_id)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self._parent_view.handle_vip_modal_submission(interaction, self.player_id.value)
 
 
 class PersistentView(View):
@@ -1588,26 +1605,17 @@ class CombinedView(PersistentView):
         self.notifier = notifier
         self._refresh_button_label()
 
-    @discord.ui.button(label="Register", style=ButtonStyle.danger, custom_id="frontline-pass-register")
-    async def register_button(self, interaction: discord.Interaction, _: Button) -> None:
+    @discord.ui.button(label="Get VIP", style=ButtonStyle.green, custom_id="frontline-pass-get-vip")
+    async def give_vip_button(self, interaction: discord.Interaction, _: Button) -> None:
         discord_id = str(interaction.user.id)
-        existing = self.database.fetch_player(discord_id)
-        if existing:
-            stored_name = self.database.fetch_player_name(discord_id)
-            display = f"{existing} ({stored_name})" if stored_name else existing
-            await interaction.response.send_message(
-                f"You're already registered. Your T17 ID `{display}` is linked to your Discord account.",
-                ephemeral=True,
-            )
-            schedule_ephemeral_cleanup(interaction)
-            return
-
+        existing_id = self.database.fetch_player(discord_id)
+        modal = VipRequestModal(self, default_player_id=existing_id)
         try:
-            await interaction.response.send_modal(PlayerIDModal(self))
+            await interaction.response.send_modal(modal)
         except discord.HTTPException:
-            logging.exception("Failed to open manual registration modal for %s", discord_id)
+            logging.exception("Failed to open VIP request modal for %s", discord_id)
             error_message = (
-                "I couldn't open the registration form. Please try again shortly or use /register_player to link your ID."
+                "I couldn't open the VIP request form. Please try again shortly or use /register_player to link your ID."
             )
             if interaction.response.is_done():
                 followup = await interaction.followup.send(error_message, ephemeral=True, wait=True)
@@ -1616,20 +1624,66 @@ class CombinedView(PersistentView):
                 await interaction.response.send_message(error_message, ephemeral=True)
                 schedule_ephemeral_cleanup(interaction)
 
-    @discord.ui.button(label="Get VIP", style=ButtonStyle.green, custom_id="frontline-pass-get-vip")
-    async def give_vip_button(self, interaction: discord.Interaction, _: Button) -> None:
-        discord_id = str(interaction.user.id)
-        steam_id = self.database.fetch_player(discord_id)
 
+    def _refresh_button_label(self) -> None:
+        self.give_vip_button.label = f"Get VIP ({self.bot.vip_duration_hours:g} hours)"
+
+    def refresh_vip_label(self) -> None:
+        self._refresh_button_label()
+
+    async def handle_vip_modal_submission(self, interaction: discord.Interaction, steam_id: str) -> None:
+        steam_id = steam_id.strip()
         if not steam_id:
-            await interaction.response.send_message(
-                "You are not linked to a T17 account. Please register first.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("T17 ID cannot be empty.", ephemeral=True)
             schedule_ephemeral_cleanup(interaction)
             return
 
-        player_name = self.database.fetch_player_name(discord_id)
+        await interaction.response.defer(ephemeral=True)
+
+        discord_id = str(interaction.user.id)
+        previous_steam_id = self.database.fetch_player(discord_id)
+        resolved_name = self.bot.lookup_player_name(steam_id)
+
+        try:
+            self.database.upsert_player(discord_id, steam_id, player_name=resolved_name)
+        except DuplicateSteamIDError as exc:
+            duplicate_message = (
+                "Error: That T17 ID is already linked to another Discord account. "
+                "A moderator has been notified."
+            )
+            followup_message = await interaction.followup.send(
+                duplicate_message,
+                ephemeral=True,
+                wait=True,
+            )
+            schedule_ephemeral_cleanup(interaction, message=followup_message)
+            await self.notifier.notify_duplicate(interaction, exc.steam_id, exc.existing_discord_id)
+            return
+
+        display_id = f"{steam_id} ({resolved_name})" if resolved_name else steam_id
+        if previous_steam_id and previous_steam_id != steam_id:
+            registration_note = f"Your T17 ID was updated to {display_id}."
+        elif not previous_steam_id:
+            registration_note = f"Your T17 ID {display_id} has been saved!"
+        else:
+            registration_note = None
+
+        await self._grant_vip_for_player(
+            interaction,
+            steam_id,
+            resolved_name or self.database.fetch_player_name(discord_id),
+            registration_note=registration_note,
+        )
+
+    async def _grant_vip_for_player(
+        self,
+        interaction: discord.Interaction,
+        steam_id: str,
+        player_name: Optional[str],
+        *,
+        registration_note: Optional[str] = None,
+    ) -> None:
+        player_name = player_name or self.database.fetch_player_name(str(interaction.user.id))
         player_display = f"{steam_id} ({player_name})" if player_name else steam_id
         duration_hours = self.bot.vip_duration_hours
         local_time = datetime.now(self.config.timezone)
@@ -1639,7 +1693,6 @@ class CombinedView(PersistentView):
         expiration_time_iso = expiration_time_utc.isoformat()
         comment = f"Discord VIP for {interaction.user.display_name} until {expiration_time_utc_str} UTC"
 
-        await interaction.response.defer(ephemeral=True)
         try:
             result = await asyncio.to_thread(
                 self.vip_service.grant_vip,
@@ -1650,8 +1703,13 @@ class CombinedView(PersistentView):
             )
         except RconError as exc:
             logging.exception("Failed to grant VIP for player %s", steam_id)
+            error_lines = [f"Error: VIP status could not be set: {exc}"]
+            if registration_note:
+                error_lines.append(registration_note)
+            if isinstance(interaction.client, FrontlinePassBot):
+                await interaction.client.refresh_announcement_message()
             followup_message = await interaction.followup.send(
-                f"Error: VIP status could not be set: {exc}",
+                "\n\n".join(error_lines),
                 ephemeral=True,
                 wait=True,
             )
@@ -1659,8 +1717,13 @@ class CombinedView(PersistentView):
             return
         except Exception as exc:  # pragma: no cover
             logging.exception("Unexpected error while granting VIP for player %s: %s", steam_id, exc)
+            error_lines = ["An unexpected error occurred while setting VIP status."]
+            if registration_note:
+                error_lines.append(registration_note)
+            if isinstance(interaction.client, FrontlinePassBot):
+                await interaction.client.refresh_announcement_message()
             followup_message = await interaction.followup.send(
-                "An unexpected error occurred while setting VIP status.",
+                "\n\n".join(error_lines),
                 ephemeral=True,
                 wait=True,
             )
@@ -1677,26 +1740,22 @@ class CombinedView(PersistentView):
         self.database.set_metadata(LAST_GRANT_METADATA_KEY, datetime.now(timezone.utc).isoformat())
         if isinstance(interaction.client, FrontlinePassBot):
             await interaction.client.refresh_announcement_message()
+
+        header_lines = []
+        if registration_note:
+            header_lines.append(registration_note)
+        header_lines.append(f"You now have VIP for {self.config.vip_duration_label} hours!")
+        header_lines.append(f"Linked ID: {player_display}")
+        header_lines.append(f"Expiration: {readable_expiration}")
         status_summary = "\n".join(f"- {line}" for line in result.status_lines)
+        message_body = "\n".join(header_lines) + "\n\n**Status**:\n" + status_summary
         followup_message = await interaction.followup.send(
-            (
-                f"You now have VIP for {self.config.vip_duration_label} hours! "
-                f"Linked ID: {player_display}\n"
-                f"Expiration: {readable_expiration}\n\n**Status**:\n{status_summary}"
-            ),
+            message_body,
             ephemeral=True,
             wait=True,
         )
         schedule_ephemeral_cleanup(interaction, message=followup_message)
-        # If the user had a temporary VIP Discord role for registration/claim, remove it now.
         await self._maybe_remove_temp_vip_role(interaction)
-
-
-    def _refresh_button_label(self) -> None:
-        self.give_vip_button.label = f"Get VIP ({self.bot.vip_duration_hours:g} hours)"
-
-    def refresh_vip_label(self) -> None:
-        self._refresh_button_label()
 
     async def complete_registration(
         self,
@@ -2151,7 +2210,7 @@ class FrontlinePassBot(commands.Bot):
                 await interaction.response.send_message(
                     (
                         f"Assigned {role.mention} to {member.mention}.\n"
-                        f"Please go to {channel_mention} and use the Register button (or /register_player), then press Get VIP.\n"
+                        f"Please go to {channel_mention} and press Get VIP, then enter the Player-ID when prompted (or use /register_player).\n"
                         f"After you claim VIP, your temporary Discord role will be removed automatically."
                     ),
                     ephemeral=True,
@@ -2162,7 +2221,7 @@ class FrontlinePassBot(commands.Bot):
                 with contextlib.suppress(discord.DiscordException):
                     await interaction.followup.send(
                         (
-                            f"Assigned {role.mention} to {member.mention}. Go to {channel_mention} to register and claim VIP."
+                            f"Assigned {role.mention} to {member.mention}. Go to {channel_mention}, press Get VIP, and enter the Player-ID to claim VIP."
                         ),
                         ephemeral=True,
                         wait=False,
