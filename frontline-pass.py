@@ -1126,25 +1126,18 @@ class FrontlinePassBot(commands.Bot):
 
             claim_channel_id = self.config.vip_claim_channel_id or self.config.channel_id
             channel_mention = f"<#{claim_channel_id}>" if claim_channel_id else "the VIP channel"
+            announcement = (
+                f"Assigned {role.mention} to {member.mention} at {interaction.user.mention}.\n"
+                f"Please go to {channel_mention} and press Get VIP, then enter the Player-ID when prompted.\n"
+                "After you claim VIP, your temporary Discord role will be removed automatically."
+            )
+
             try:
-                await interaction.response.send_message(
-                    (
-                        f"Assigned {role.mention} to {member.mention}.\n"
-                        f"Please go to {channel_mention} and press Get VIP, then enter the Player-ID when prompted.\n"
-                        "After you claim VIP, your temporary Discord role will be removed automatically."
-                    ),
-                    ephemeral=True,
-                )
-                schedule_ephemeral_cleanup(interaction)
+                await interaction.response.send_message(announcement, ephemeral=False)
             except discord.InteractionResponded:
+                # Fall back to a follow-up if a response was already sent earlier in the flow.
                 with contextlib.suppress(discord.DiscordException):
-                    await interaction.followup.send(
-                        (
-                            f"Assigned {role.mention} to {member.mention}. Go to {channel_mention}, press Get VIP, and enter the Player-ID to claim VIP."
-                        ),
-                        ephemeral=True,
-                        wait=False,
-                    )
+                    await interaction.followup.send(announcement, ephemeral=False, wait=False)
 
 
 def create_bot(config: AppConfig, vip_service: VipService) -> commands.Bot:
