@@ -71,8 +71,11 @@ class DuplicateSteamIDError(Exception):
         self.existing_discord_id = existing_discord_id
 
 
+class VipHTTPError(Exception):
+    """Raised when CRCON HTTP operations fail."""
+
+
 def build_announcement_embed(config: AppConfig, database: "Database", vip_duration_hours: float) -> discord.Embed:
-    total_players = database.count_players()
     last_grant_text = "No VIP grants yet."
     last_grant_value = database.get_metadata(LAST_GRANT_METADATA_KEY)
     if last_grant_value:
@@ -88,14 +91,13 @@ def build_announcement_embed(config: AppConfig, database: "Database", vip_durati
     embed = discord.Embed(
         title=ANNOUNCEMENT_TITLE,
         description=(
-            "Use the button below to request VIP access.\n"
+            "Use the button below to activate your VIP access.\n"
             f"VIP duration: **{vip_duration_hours:g} hours**.\n"
-            "Enter your Player-ID when prompted; it will be remembered for future requests."
+            'When registering you need to add your player_id number string i.e. "2805d5bbe14b6ec432f82e5cb859d012" from https://hllrecords.com'
         ),
         color=0x2F3136,
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Registered Players", value=str(total_players), inline=True)
     embed.add_field(name="Last VIP Grant", value=last_grant_text, inline=True)
     embed.add_field(name="Local Timezone", value=config.timezone_name, inline=True)
     embed.set_footer(text="Buttons stay active across restarts.")
@@ -293,10 +295,6 @@ class AppConfig:
     channel_id: int
     timezone: pytz.BaseTzInfo
     timezone_name: str
-    rcon_host: str
-    rcon_port: int
-    rcon_password: str
-    rcon_version: int
     database_path: str
     database_table: str
     moderation_channel_id: Optional[int] = None
@@ -413,10 +411,6 @@ def load_config() -> AppConfig:
     vip_duration_hours = require_float("VIP_DURATION_HOURS")
     channel_id = require_int("CHANNEL_ID")
     timezone_name = require_str("LOCAL_TIMEZONE")
-    rcon_host = require_str("RCON_HOST")
-    rcon_port = require_int("RCON_PORT")
-    rcon_password = require_str("RCON_PASSWORD")
-    rcon_version = optional_int("RCON_VERSION") or 2
 
     if vip_duration_hours is not None and vip_duration_hours <= 0:
         errors.append("VIP_DURATION_HOURS must be greater than zero")
@@ -441,47 +435,43 @@ def load_config() -> AppConfig:
     vip_temp_role_id = optional_int("VIP_TEMP_ROLE_ID")
     vip_claim_channel_id = optional_int("VIP_CLAIM_CHANNEL_ID")
 
-    http_base_url_raw = get_value("CRCON_HTTP_BASE_URL")
+    http_base_url = require_str("CRCON_HTTP_BASE_URL")
     http_bearer_token = get_value("CRCON_HTTP_BEARER_TOKEN")
     http_username = get_value("CRCON_HTTP_USERNAME")
     http_password = get_value("CRCON_HTTP_PASSWORD")
     http_verify = optional_bool("CRCON_HTTP_VERIFY", default=True)
     http_timeout = optional_float("CRCON_HTTP_TIMEOUT", default=20.0) or 20.0
-
-    http_credentials: Optional[HttpCredentials] = None
-    trimmed_base = str(http_base_url_raw).strip() if http_base_url_raw else ""
+    trimmed_base = http_base_url.strip()
     trimmed_token = str(http_bearer_token).strip() if http_bearer_token else ""
     trimmed_username = str(http_username).strip() if http_username else ""
-    password_provided = bool(http_password and str(http_password).strip())
+    trimmed_password = str(http_password).strip() if http_password else ""
 
-    if any((trimmed_base, trimmed_token, trimmed_username, http_password)):
-        normalized_base = trimmed_base.rstrip("/")
-        if not normalized_base:
-            errors.append("CRCON_HTTP_BASE_URL is required when using the HTTP API integration")
-        else:
-            lowered_base = normalized_base.lower()
-            if lowered_base.endswith("/api") or "/api/" in lowered_base:
-                errors.append(
-                    "CRCON_HTTP_BASE_URL should not include '/api'. Provide the host only "
-                    "(e.g. https://example.com:8010)."
-                )
-        if not trimmed_token and not (trimmed_username and password_provided):
-            errors.append(
-                "Provide either CRCON_HTTP_BEARER_TOKEN or both CRCON_HTTP_USERNAME and CRCON_HTTP_PASSWORD "
-                "when enabling the HTTP API integration"
-            )
-        if trimmed_username and not password_provided:
-            errors.append("CRCON_HTTP_PASSWORD is required when CRCON_HTTP_USERNAME is provided")
+    if not trimmed_base:
+        errors.append("CRCON_HTTP_BASE_URL must not be empty")
+    elif trimmed_base.lower().endswith("/api"):
+        errors.append(
+            "CRCON_HTTP_BASE_URL should not include '/api'. Provide the host only "
+            "(e.g. https://example.com:8010)."
+        )
 
-        if normalized_base and (trimmed_token or (trimmed_username and password_provided)):
-            http_credentials = HttpCredentials(
-                base_url=normalized_base,
-                bearer_token=trimmed_token or None,
-                username=trimmed_username or None,
-                password=str(http_password).strip() if password_provided else None,
-                verify=http_verify if http_verify is not None else True,
-                timeout=http_timeout,
-            )
+    if not trimmed_token and not (trimmed_username and trimmed_password):
+        errors.append(
+            "Provide either CRCON_HTTP_BEARER_TOKEN or both CRCON_HTTP_USERNAME and CRCON_HTTP_PASSWORD."
+        )
+    if trimmed_username and not trimmed_password:
+        errors.append("CRCON_HTTP_PASSWORD is required when CRCON_HTTP_USERNAME is provided")
+
+    normalized_base = trimmed_base.rstrip("/") if trimmed_base else ""
+    http_credentials: Optional[HttpCredentials] = None
+    if normalized_base and (trimmed_token or (trimmed_username and trimmed_password)):
+        http_credentials = HttpCredentials(
+            base_url=normalized_base,
+            bearer_token=trimmed_token or None,
+            username=trimmed_username or None,
+            password=trimmed_password or None,
+            verify=http_verify if http_verify is not None else True,
+            timeout=http_timeout,
+        )
 
     crcon_database_url_raw = get_value("CRCON_DATABASE_URL")
     crcon_database_url = str(crcon_database_url_raw).strip() if crcon_database_url_raw else None
@@ -491,19 +481,12 @@ def load_config() -> AppConfig:
 
     assert vip_duration_hours is not None
     assert channel_id is not None
-    assert rcon_port is not None
-    assert rcon_version is not None
-
     return AppConfig(
         discord_token=discord_token,
         vip_duration_hours=vip_duration_hours,
         channel_id=channel_id,
         timezone=timezone,
         timezone_name=timezone_name,
-        rcon_host=rcon_host,
-        rcon_port=rcon_port,
-        rcon_password=rcon_password,
-        rcon_version=rcon_version,
         database_path=database_path,
         database_table=database_table,
         moderation_channel_id=moderation_channel_id,
@@ -907,413 +890,6 @@ class Database:
         return results
 
 
-class RconError(Exception):
-    """Raised when an RCON operation fails."""
-
-
-class RconClient:
-    def __init__(self, host: str, port: int, password: str, *, version: int = 2, timeout: float = 10.0) -> None:
-        self.host = host
-        self.port = port
-        self.password = password
-        self.version = version
-        self.timeout = timeout
-        self._socket: Optional[socket.socket] = None
-        self._xor_key: Optional[bytes] = None
-        self._auth_token: str = ""
-        self._packet_id: int = 0
-
-    def __enter__(self) -> "RconClient":
-        self.connect()
-        self.login()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
-
-    def connect(self) -> None:
-        try:
-            self._socket = socket.create_connection((self.host, self.port), timeout=self.timeout)
-            self._socket.settimeout(self.timeout)
-        except OSError as exc:
-            raise RconError(f"Unable to connect to RCON server {self.host}:{self.port}.") from exc
-
-        self._packet_id = 0
-        self._xor_key = None
-        self._auth_token = ""
-
-        self._send_packet(
-            self._build_payload("ServerConnect", "", auth_token=""),
-            encrypt=False,
-        )
-        _, response = self._read_packet(encrypted=False)
-        self._assert_success(response, "ServerConnect")
-
-        xor_content = self._get_content(response)
-        if not isinstance(xor_content, str):
-            raise RconError("Invalid XOR key returned from server.")
-
-        try:
-            self._xor_key = base64.b64decode(xor_content.strip())
-        except (binascii.Error, AttributeError) as exc:
-            raise RconError("Failed to decode XOR key from ServerConnect response.") from exc
-
-        if not self._xor_key:
-            raise RconError("Empty XOR key received from ServerConnect response.")
-
-    def close(self) -> None:
-        if self._socket:
-            try:
-                self._socket.close()
-            except OSError:
-                pass
-            finally:
-                self._socket = None
-
-    def login(self) -> None:
-        self._send_packet(
-            self._build_payload("Login", self.password, auth_token=""),
-        )
-        _, response = self._read_packet()
-        self._assert_success(response, "Login")
-
-        token = self._get_content(response)
-        if not isinstance(token, str) or not token:
-            raise RconError("Login response did not include an authentication token.")
-        self._auth_token = token
-
-    def add_vip(self, player_id: str, comment: str = "") -> str:
-        response = self.execute("AddVip", {"PlayerId": player_id, "Description": comment})
-        return self._get_status_message(response) or "VIP added successfully."
-
-    def execute(self, command: str, content_body: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
-        self._send_packet(self._build_payload(command, content_body))
-        _, response = self._read_packet()
-        self._assert_success(response, command)
-        return response
-
-    def _build_payload(
-        self,
-        command: str,
-        content_body: Union[str, Dict[str, Any]],
-        *,
-        auth_token: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        return {
-            "AuthToken": auth_token if auth_token is not None else self._auth_token,
-            "Version": self.version,
-            "Name": command,
-            "ContentBody": content_body,
-        }
-
-    def _send_packet(self, payload: Dict[str, Any], *, encrypt: bool = True) -> int:
-        if not self._socket:
-            raise RconError("Not connected to the RCON server.")
-
-        data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        if encrypt:
-            data = self._xor(data)
-
-        packet_id = self._packet_id
-        self._packet_id += 1
-
-        header = struct.pack("<II", packet_id, len(data))
-        try:
-            self._socket.sendall(header + data)
-        except OSError as exc:
-            raise RconError("Failed to send data to the RCON server.") from exc
-        return packet_id
-
-    def _read_packet(self, *, encrypted: bool = True) -> Tuple[int, Dict[str, Any]]:
-        if not self._socket:
-            raise RconError("Not connected to the RCON server.")
-
-        header = self._recv_exact(8)
-        packet_id, length = struct.unpack("<II", header)
-        body = self._recv_exact(length)
-
-        if encrypted:
-            body = self._xor(body)
-
-        try:
-            payload = json.loads(body.decode("utf-8"))
-        except json.JSONDecodeError as exc:
-            raise RconError("Failed to decode response from the RCON server.") from exc
-        return packet_id, payload
-
-    def _recv_exact(self, size: int) -> bytes:
-        if not self._socket:
-            raise RconError("Not connected to the RCON server.")
-
-        buffer = bytearray()
-        while len(buffer) < size:
-            try:
-                chunk = self._socket.recv(size - len(buffer))
-            except OSError as exc:
-                raise RconError("Connection to the RCON server was interrupted.") from exc
-            if not chunk:
-                raise RconError("RCON server closed the connection unexpectedly.")
-            buffer.extend(chunk)
-        return bytes(buffer)
-
-    def _xor(self, data: bytes) -> bytes:
-        if not self._xor_key:
-            return data
-        key = self._xor_key
-        return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
-
-    @staticmethod
-    def _get_status_code(payload: Dict[str, Any]) -> Optional[int]:
-        code = payload.get("StatusCode")
-        if code is None:
-            code = payload.get("statusCode")
-        return code
-
-    @staticmethod
-    def _get_status_message(payload: Dict[str, Any]) -> Optional[str]:
-        message = payload.get("StatusMessage")
-        if message is None:
-            message = payload.get("statusMessage")
-        return message
-
-    @staticmethod
-    def _get_content(payload: Dict[str, Any]) -> Any:
-        if "ContentBody" in payload:
-            return payload["ContentBody"]
-        return payload.get("contentBody")
-
-    def _assert_success(self, payload: Dict[str, Any], command: str) -> None:
-        status_code = self._get_status_code(payload)
-        if status_code != 200:
-            message = self._get_status_message(payload) or f"{command} failed with status {status_code}."
-            raise RconError(message)
-
-
-class VipService:
-    def __init__(self, config: AppConfig, player_directory: Optional[PlayerDirectory] = None) -> None:
-        self._config = config
-        self._http_client = VipHttpClient(config.http_credentials) if config.http_credentials else None
-        self._player_directory = player_directory
-
-    def grant_vip(
-        self,
-        player_id: str,
-        comment: str,
-        expiration_iso: Optional[str],
-        *,
-        player_name: Optional[str] = None,
-    ) -> VipGrantResult:
-        status_lines: List[str] = []
-        detail = ""
-        overall_success = False
-        resolved_player_name = player_name
-        if resolved_player_name is None and self._player_directory:
-            resolved_player_name = self._player_directory.lookup_player_name(player_id)
-
-        if self._http_client:
-            try:
-                response = self._http_client.add_vip(
-                    player_id,
-                    comment,
-                    expiration_iso,
-                    player_name=resolved_player_name,
-                )
-                message = response.get("result")
-                if isinstance(message, dict):
-                    message = message.get("result") or message
-                if message is None:
-                    message = "HTTP API add_vip succeeded."
-                status_lines.append(f"HTTP API: {message}")
-                detail = str(message)
-                overall_success = True
-            except VipHTTPError as exc:
-                status_lines.append(f"HTTP API add_vip failed: {exc}")
-
-        if not overall_success:
-            try:
-                rcon_message = self._grant_vip_via_rcon(player_id, comment)
-                status_lines.append(f"RCON AddVip succeeded: {rcon_message}")
-                detail = rcon_message
-                overall_success = True
-            except RconError as exc:
-                status_lines.append(f"RCON AddVip failed: {exc}")
-                combined = "; ".join(status_lines) if status_lines else str(exc)
-                raise RconError(combined) from exc
-        elif self._http_client:
-            status_lines.append("RCON fallback not required.")
-
-        return VipGrantResult(status_lines=status_lines, detail=detail or "VIP added successfully.")
-
-    def _grant_vip_via_rcon(self, player_id: str, comment: str) -> str:
-        with RconClient(
-            self._config.rcon_host,
-            self._config.rcon_port,
-            self._config.rcon_password,
-            version=self._config.rcon_version,
-        ) as client:
-            return client.add_vip(player_id, comment)
-
-    def search_players(self, prefix: str, *, limit: int = 20) -> List[Tuple[str, str]]:
-        if not prefix:
-            return []
-        results: List[Tuple[str, str]] = []
-        if self._player_directory:
-            try:
-                results.extend(self._player_directory.search_players(prefix, limit=limit))
-            except Exception:
-                logging.exception("PlayerDirectory search failed for prefix %s", prefix)
-
-        if self._http_client:
-            try:
-                http_results = self._http_client.search_players(prefix, limit=limit)
-                results.extend(http_results)
-            except VipHTTPError:
-                logging.exception("HTTP search failed for prefix %s", prefix)
-
-        # Deduplicate while preserving order
-        seen: Set[str] = set()
-        deduped: List[Tuple[str, str]] = []
-        for player_id, name in results:
-            key = f"{player_id}:{name}"
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append((player_id, name))
-            if len(deduped) >= limit:
-                break
-        return deduped
-
-
-class ModeratorNotifier:
-    def __init__(self, config: AppConfig) -> None:
-        self._channel_id = config.moderation_channel_id
-        self._role_id = config.moderator_role_id
-
-    async def notify_duplicate(self, interaction: discord.Interaction, steam_id: str, existing_discord_id: Optional[str]) -> None:
-        if not self._channel_id:
-            logging.info("Duplicate Player-ID detected but MODERATION_CHANNEL_ID is not configured.")
-            return
-
-        channel = interaction.client.get_channel(self._channel_id)
-        if channel is None:
-            try:
-                channel = await interaction.client.fetch_channel(self._channel_id)
-            except discord.DiscordException:
-                logging.exception("Failed to fetch moderation channel with id %s", self._channel_id)
-                return
-
-        # Ensure the channel supports send()
-        if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.DMChannel)):
-            logging.error("Configured moderation channel %s is not a messageable channel.", self._channel_id)
-            return
-
-        role_mention = f"<@&{self._role_id}>" if self._role_id else ""
-        existing_mention = f"<@{existing_discord_id}>" if existing_discord_id else "an unknown user"
-
-        content = (
-            f"{role_mention} Duplicate Player-ID attempt detected.\n"
-            f"Player-ID `{steam_id}` is already associated with {existing_mention}. "
-            f"Attempted by {interaction.user.mention}."
-        ).strip()
-
-        try:
-            await channel.send(content)
-        except discord.DiscordException:
-            logging.exception("Failed to notify moderators about duplicate Player-ID %s", steam_id)
-
-
-class VipHTTPError(Exception):
-    """Raised when the optional HTTP API integration fails."""
-
-
-class PlayerDirectory:
-    def __init__(self, database_url: str, *, cache_ttl: float = 300.0) -> None:
-        self._database_url = database_url
-        self._engine: Engine = create_engine(database_url, pool_pre_ping=True, future=True)
-        self._cache_ttl = cache_ttl
-        self._cache: Dict[str, Tuple[float, Optional[str]]] = {}
-        self._lock = threading.Lock()
-        self._latest_name_query = text(
-            """
-            SELECT name
-            FROM player_names
-            WHERE playersteamid_id = :steam_id
-            ORDER BY last_seen DESC
-            LIMIT 1
-            """
-        )
-        self._search_query = text(
-            """
-            SELECT DISTINCT ON (pn.playersteamid_id)
-                pn.playersteamid_id,
-                pn.name
-            FROM player_names pn
-            WHERE pn.name ILIKE :search
-               OR (:exact_id IS NOT NULL AND pn.playersteamid_id = :exact_id)
-            ORDER BY pn.playersteamid_id, pn.last_seen DESC
-            LIMIT :limit
-            """
-        )
-
-    def lookup_player_name(self, steam_id: str) -> Optional[str]:
-        if not steam_id:
-            return None
-
-        now = time.time()
-        with self._lock:
-            cached = self._cache.get(steam_id)
-            if cached and now - cached[0] <= self._cache_ttl:
-                return cached[1]
-
-        try:
-            with self._engine.connect() as connection:
-                row = connection.execute(self._latest_name_query, {"steam_id": steam_id}).first()
-                name: Optional[str]
-                if row is None:
-                    name = None
-                else:
-                    value = row[0]
-                    name = str(value).strip() if value is not None else None
-        except SQLAlchemyError:
-            logging.exception("Failed to look up player name for %s", steam_id)
-            name = None
-
-        with self._lock:
-            self._cache[steam_id] = (now, name)
-        return name
-
-    def search_players(self, prefix: str, *, limit: int = 20) -> List[Tuple[str, str]]:
-        if not prefix:
-            return []
-        limit = max(1, min(limit, 25))
-        try:
-            with self._engine.connect() as connection:
-                rows = connection.execute(
-                    self._search_query,
-                    {
-                        "search": f"{prefix}%",
-                        "exact_id": prefix if prefix.isdigit() else None,
-                        "limit": limit,
-                    },
-                ).fetchall()
-        except SQLAlchemyError:
-            logging.exception("Failed to search player names for prefix %s", prefix)
-            return []
-
-        results: List[Tuple[str, str]] = []
-        for row in rows:
-            if len(row) < 2:
-                continue
-            steam_id_raw, name_raw = row[0], row[1]
-            if steam_id_raw is None or name_raw is None:
-                continue
-            steam_id = str(steam_id_raw).strip()
-            player_name = str(name_raw).strip()
-            if steam_id and player_name:
-                results.append((steam_id, player_name))
-        return results
-
-
 class VipHttpClient:
     def __init__(
         self,
@@ -1539,32 +1115,172 @@ class VipHttpClient:
         raise VipHTTPError("Unexpected response format; expected JSON object.")
 
 
+class VipService:
+    def __init__(self, config: AppConfig, player_directory: Optional[PlayerDirectory] = None) -> None:
+        self._config = config
+        self._player_directory = player_directory
+        self._http_client = VipHttpClient(config.http_credentials) if config.http_credentials else None
+
+    def grant_vip(
+        self,
+        player_id: str,
+        comment: str,
+        expiration_iso: Optional[str],
+        *,
+        player_name: Optional[str] = None,
+    ) -> VipGrantResult:
+        resolved_player_name = player_name
+        if resolved_player_name is None and self._player_directory:
+            try:
+                resolved_player_name = self._player_directory.lookup_player_name(player_id)
+            except Exception:
+                logging.exception("PlayerDirectory lookup failed for %s", player_id)
+
+        if not self._http_client:
+            raise VipHTTPError("CRCON HTTP credentials are not configured.")
+
+        response = self._http_client.add_vip(
+            player_id,
+            comment,
+            expiration_iso,
+            player_name=resolved_player_name,
+        )
+
+        message = response.get("result")
+        if isinstance(message, dict):
+            message = message.get("result") or message
+        if message is None:
+            message = "HTTP API add_vip succeeded."
+        detail = str(message)
+        status_lines = [f"HTTP API: {message}"]
+        return VipGrantResult(status_lines=status_lines, detail=detail)
+
+    def search_players(self, prefix: str, *, limit: int = 20) -> List[Tuple[str, str]]:
+        if not prefix:
+            return []
+
+        combined: List[Tuple[str, str]] = []
+        remaining = max(1, limit)
+
+        if self._player_directory and remaining > 0:
+            try:
+                results = self._player_directory.search_players(prefix, limit=remaining)
+                combined.extend(results)
+                remaining = max(0, limit - len(combined))
+            except Exception:
+                logging.exception("PlayerDirectory search failed for prefix %s", prefix)
+
+        if self._http_client and remaining > 0:
+            try:
+                http_results = self._http_client.search_players(prefix, limit=remaining)
+                combined.extend(http_results)
+            except VipHTTPError:
+                logging.exception("HTTP search failed for prefix %s", prefix)
+
+        deduped: List[Tuple[str, str]] = []
+        seen: Set[str] = set()
+        for player_id, name in combined:
+            key = f"{player_id}:{name}"
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append((player_id, name))
+            if len(deduped) >= limit:
+                break
+        return deduped
+
+
+class PlayerDirectory:
+    def __init__(self, database_url: str, *, cache_ttl: float = 300.0) -> None:
+        self._database_url = database_url
+        self._engine: Engine = create_engine(database_url, pool_pre_ping=True, future=True)
+        self._cache_ttl = cache_ttl
+        self._cache: Dict[str, Tuple[float, Optional[str]]] = {}
+        self._lock = threading.Lock()
+        self._latest_name_query = text(
+            """
+            SELECT name
+            FROM player_names
+            WHERE playersteamid_id = :steam_id
+            ORDER BY last_seen DESC
+            LIMIT 1
+            """
+        )
+        self._search_query = text(
+            """
+            SELECT DISTINCT ON (pn.playersteamid_id)
+                pn.playersteamid_id,
+                pn.name
+            FROM player_names pn
+            WHERE pn.name ILIKE :search
+               OR (:exact_id IS NOT NULL AND pn.playersteamid_id = :exact_id)
+            ORDER BY pn.playersteamid_id, pn.last_seen DESC
+            LIMIT :limit
+            """
+        )
+
+    def lookup_player_name(self, steam_id: str) -> Optional[str]:
+        if not steam_id:
+            return None
+
+        now = time.time()
+        with self._lock:
+            cached = self._cache.get(steam_id)
+            if cached and now - cached[0] <= self._cache_ttl:
+                return cached[1]
+
+        try:
+            with self._engine.connect() as connection:
+                row = connection.execute(self._latest_name_query, {"steam_id": steam_id}).first()
+                if row is None:
+                    name: Optional[str] = None
+                else:
+                    value = row[0]
+                    name = str(value).strip() if value is not None else None
+        except SQLAlchemyError:
+            logging.exception("Failed to look up player name for %s", steam_id)
+            name = None
+
+        with self._lock:
+            self._cache[steam_id] = (now, name)
+        return name
+
+    def search_players(self, prefix: str, *, limit: int = 20) -> List[Tuple[str, str]]:
+        if not prefix:
+            return []
+        limit = max(1, min(limit, 25))
+        try:
+            with self._engine.connect() as connection:
+                rows = connection.execute(
+                    self._search_query,
+                    {
+                        "search": f"{prefix}%",
+                        "exact_id": prefix if prefix.isdigit() else None,
+                        "limit": limit,
+                    },
+                ).fetchall()
+        except SQLAlchemyError:
+            logging.exception("Failed to search player names for prefix %s", prefix)
+            return []
+
+        results: List[Tuple[str, str]] = []
+        for row in rows:
+            if len(row) < 2:
+                continue
+            steam_id_raw, name_raw = row[0], row[1]
+            if steam_id_raw is None or name_raw is None:
+                continue
+            steam_id = str(steam_id_raw).strip()
+            name = str(name_raw).strip()
+            if not steam_id or not name:
+                continue
+            results.append((steam_id, name))
+        return results
+
 @dataclass
 class VipGrantResult:
     status_lines: List[str]
     detail: str
-
-
-class PlayerIDModal(Modal):
-    def __init__(self, parent_view: "CombinedView"):
-        super().__init__(title="Please input Player-ID", custom_id="frontline-pass-player-id-modal")
-        self._parent_view = parent_view
-        self.database = parent_view.database
-        self.notifier = parent_view.notifier
-        self.player_id = TextInput(
-            label="T17 / Steam ID",
-            placeholder=PLAYER_ID_PLACEHOLDER,
-            custom_id="frontline-pass-player-id-input",
-        )
-        self.add_item(self.player_id)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        steam_id = self.player_id.value
-        await self._parent_view.complete_registration(
-            interaction,
-            steam_id,
-            player_name=self._parent_view.bot.lookup_player_name(steam_id.strip()),
-        )
 
 
 class VipRequestModal(Modal):
@@ -1615,7 +1331,7 @@ class CombinedView(PersistentView):
         except discord.HTTPException:
             logging.exception("Failed to open VIP request modal for %s", discord_id)
             error_message = (
-                "I couldn't open the VIP request form. Please try again shortly or use /register_player to link your ID."
+                "I couldn't open the VIP request form. Please try again shortly or contact a moderator for assistance."
             )
             if interaction.response.is_done():
                 followup = await interaction.followup.send(error_message, ephemeral=True, wait=True)
@@ -1662,17 +1378,17 @@ class CombinedView(PersistentView):
 
         display_id = f"{steam_id} ({resolved_name})" if resolved_name else steam_id
         if previous_steam_id and previous_steam_id != steam_id:
-            registration_note = f"Your T17 ID was updated to {display_id}."
+            status_note = f"Saved Player-ID updated to {display_id}."
         elif not previous_steam_id:
-            registration_note = f"Your T17 ID {display_id} has been saved!"
+            status_note = f"Player-ID {display_id} recorded for fast access next time."
         else:
-            registration_note = None
+            status_note = None
 
         await self._grant_vip_for_player(
             interaction,
             steam_id,
             resolved_name or self.database.fetch_player_name(discord_id),
-            registration_note=registration_note,
+            status_note=status_note,
         )
 
     async def _grant_vip_for_player(
@@ -1681,7 +1397,7 @@ class CombinedView(PersistentView):
         steam_id: str,
         player_name: Optional[str],
         *,
-        registration_note: Optional[str] = None,
+        status_note: Optional[str] = None,
     ) -> None:
         player_name = player_name or self.database.fetch_player_name(str(interaction.user.id))
         player_display = f"{steam_id} ({player_name})" if player_name else steam_id
@@ -1701,11 +1417,11 @@ class CombinedView(PersistentView):
                 expiration_time_iso,
                 player_name=player_name,
             )
-        except RconError as exc:
+        except VipHTTPError as exc:
             logging.exception("Failed to grant VIP for player %s", steam_id)
             error_lines = [f"Error: VIP status could not be set: {exc}"]
-            if registration_note:
-                error_lines.append(registration_note)
+            if status_note:
+                error_lines.append(status_note)
             if isinstance(interaction.client, FrontlinePassBot):
                 await interaction.client.refresh_announcement_message()
             followup_message = await interaction.followup.send(
@@ -1718,8 +1434,8 @@ class CombinedView(PersistentView):
         except Exception as exc:  # pragma: no cover
             logging.exception("Unexpected error while granting VIP for player %s: %s", steam_id, exc)
             error_lines = ["An unexpected error occurred while setting VIP status."]
-            if registration_note:
-                error_lines.append(registration_note)
+            if status_note:
+                error_lines.append(status_note)
             if isinstance(interaction.client, FrontlinePassBot):
                 await interaction.client.refresh_announcement_message()
             followup_message = await interaction.followup.send(
@@ -1742,11 +1458,11 @@ class CombinedView(PersistentView):
             await interaction.client.refresh_announcement_message()
 
         header_lines = []
-        if registration_note:
-            header_lines.append(registration_note)
         header_lines.append(f"You now have VIP for {self.config.vip_duration_label} hours!")
         header_lines.append(f"Linked ID: {player_display}")
         header_lines.append(f"Expiration: {readable_expiration}")
+        if status_note:
+            header_lines.append(status_note)
         status_summary = "\n".join(f"- {line}" for line in result.status_lines)
         message_body = "\n".join(header_lines) + "\n\n**Status**:\n" + status_summary
         followup_message = await interaction.followup.send(
@@ -1981,34 +1697,6 @@ class FrontlinePassBot(commands.Bot):
 
     async def _register_commands(self) -> None:
         @self.tree.command(
-            name="register_player",
-            description="Link your T17 ID to your Discord account.",
-        )
-        async def register_player(interaction: discord.Interaction) -> None:
-            parent_view = self.persistent_view
-            if not parent_view:
-                await interaction.response.send_message(
-                    "The registration system is not ready yet. Please try again shortly.",
-                    ephemeral=True,
-                )
-                schedule_ephemeral_cleanup(interaction)
-                return
-
-            discord_id = str(interaction.user.id)
-            existing = parent_view.database.fetch_player(discord_id)
-            if existing:
-                stored_name = parent_view.database.fetch_player_name(discord_id)
-                display = f"{existing} ({stored_name})" if stored_name else existing
-                await interaction.response.send_message(
-                    f"You're already registered. Your T17 ID `{display}` is linked to your Discord account.",
-                    ephemeral=True,
-                )
-                schedule_ephemeral_cleanup(interaction)
-                return
-
-            await interaction.response.send_modal(PlayerIDModal(parent_view))
-
-        @self.tree.command(
             name="repost_frontline_controls",
             description="Repost the Frontline VIP control panel.",
         )
@@ -2210,7 +1898,7 @@ class FrontlinePassBot(commands.Bot):
                 await interaction.response.send_message(
                     (
                         f"Assigned {role.mention} to {member.mention}.\n"
-                        f"Please go to {channel_mention} and press Get VIP, then enter the Player-ID when prompted (or use /register_player).\n"
+                        f"Please go to {channel_mention} and press Get VIP, then enter the Player-ID when prompted.\n"
                         f"After you claim VIP, your temporary Discord role will be removed automatically."
                     ),
                     ephemeral=True,

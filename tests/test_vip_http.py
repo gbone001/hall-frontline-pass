@@ -187,15 +187,8 @@ class VipServiceTests(unittest.TestCase):
             channel_id=1,
             timezone=pytz.UTC,
             timezone_name="UTC",
-            rcon_host="localhost",
-            rcon_port=1234,
-            rcon_password="pwd",
-            rcon_version=2,
             database_path=":memory:",
             database_table="vip_players",
-            moderation_channel_id=None,
-            moderator_role_id=None,
-            announcement_message_id=None,
             http_credentials=HttpCredentials(
                 base_url="https://example/api",
                 bearer_token="abc123",
@@ -203,12 +196,11 @@ class VipServiceTests(unittest.TestCase):
             crcon_database_url=None,
         )
 
-    def test_prefers_http_before_rcon(self) -> None:
+    def test_grant_vip_uses_http_client(self) -> None:
         service = VipService(self.config, None)
         fake_http_client = mock.Mock()
         fake_http_client.add_vip.return_value = {"result": "ok"}
         service._http_client = fake_http_client  # type: ignore[attr-defined]
-        service._grant_vip_via_rcon = mock.Mock()  # type: ignore[attr-defined]
 
         result = service.grant_vip("steam123", "comment", None)
 
@@ -216,7 +208,6 @@ class VipServiceTests(unittest.TestCase):
         args, kwargs = fake_http_client.add_vip.call_args
         self.assertEqual(args[:3], ("steam123", "comment", None))
         self.assertIsNone(kwargs.get("player_name"))
-        service._grant_vip_via_rcon.assert_not_called()  # type: ignore[attr-defined]
         self.assertIn("HTTP API", result.status_lines[0])
 
     def test_passes_player_name_when_directory_available(self) -> None:
