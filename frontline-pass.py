@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO)
 
 ANNOUNCEMENT_TITLE = "VIP Control Center"
 PLAYER_ID_PLACEHOLDER = (
-    "Paste your 32-character player ID from hllrecords.com (e.g. 2805d5bbe14b6ec432f82e5cb859d012)."
+    "Visit hllrecords.com, copy your Player_ID, paste it here. Submit adds VIP and removes this channel."
 )
 
 
