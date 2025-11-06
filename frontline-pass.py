@@ -204,21 +204,29 @@ class AnnouncementManager:
 
 
 def _resolve_database_path(explicit_path: Optional[str]) -> str:
+    def _default_path() -> str:
+        fallback_dirs = [
+            os.getenv("RAILWAY_VOLUME_MOUNT_PATH"),
+            os.getenv("RAILWAY_VOLUME_DIR"),
+            os.getenv("RAILWAY_DATA_DIR"),
+            os.getenv("DATA_DIR"),
+        ]
+        for base_dir in fallback_dirs:
+            if base_dir:
+                return os.path.join(base_dir, "vip-data.json")
+        return "vip-data.json"
+
     if explicit_path:
+        lowered = explicit_path.lower()
+        if lowered.startswith(("postgres://", "postgresql://", "mysql://", "mssql://", "oracle://")):
+            logging.info(
+                "Remote database URL %s ignored for manual registration; using JSON file instead.",
+                explicit_path,
+            )
+            return _default_path()
         return explicit_path
 
-    fallback_dirs = [
-        os.getenv("RAILWAY_VOLUME_MOUNT_PATH"),
-        os.getenv("RAILWAY_VOLUME_DIR"),
-        os.getenv("RAILWAY_DATA_DIR"),
-        os.getenv("DATA_DIR"),
-    ]
-
-    for base_dir in fallback_dirs:
-        if base_dir:
-            return os.path.join(base_dir, "vip-data.json")
-
-    return "vip-data.json"
+    return _default_path()
 
 
 def _parse_bool_env(name: str, raw: Optional[str], errors: List[str]) -> Optional[bool]:
@@ -1594,7 +1602,19 @@ class CombinedView(PersistentView):
             schedule_ephemeral_cleanup(interaction)
             return
 
-        await interaction.response.send_modal(PlayerIDModal(self))
+        try:
+            await interaction.response.send_modal(PlayerIDModal(self))
+        except discord.HTTPException:
+            logging.exception("Failed to open manual registration modal for %s", discord_id)
+            error_message = (
+                "I couldn't open the registration form. Please try again shortly or use /register_player to link your ID."
+            )
+            if interaction.response.is_done():
+                followup = await interaction.followup.send(error_message, ephemeral=True, wait=True)
+                schedule_ephemeral_cleanup(interaction, message=followup)
+            else:
+                await interaction.response.send_message(error_message, ephemeral=True)
+                schedule_ephemeral_cleanup(interaction)
 
     @discord.ui.button(label="Get VIP", style=ButtonStyle.green, custom_id="frontline-pass-get-vip")
     async def give_vip_button(self, interaction: discord.Interaction, _: Button) -> None:
@@ -1773,14 +1793,14 @@ def create_database(config: AppConfig) -> Database:
 
 
 def create_player_directory(config: AppConfig) -> Optional[PlayerDirectory]:
-    if not config.crcon_database_url:
-        return None
-    try:
-        directory = PlayerDirectory(config.crcon_database_url)
-    except Exception:
-        logging.exception("Failed to initialise PlayerDirectory for %s", config.crcon_database_url)
-        return None
-    return directory
+    if config.crcon_database_url:
+        logging.info(
+            "CRCON database URL %s provided but player directory lookups are disabled for manual registration.",
+            config.crcon_database_url,
+        )
+    else:
+        logging.info("CRCON database URL not configured; player directory search remains disabled.")
+    return None
 
 
 class FrontlinePassBot(commands.Bot):
