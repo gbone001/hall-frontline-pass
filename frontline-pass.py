@@ -1132,6 +1132,18 @@ class FrontlinePassBot(commands.Bot):
                 with contextlib.suppress(discord.DiscordException):
                     await interaction.followup.send(announcement, ephemeral=False, wait=False)
 
+            dm_message = (
+                f"Hi {member.display_name}, {interaction.user.display_name} assigned you the {role.name} role so you can claim VIP.\n"
+                f"Head over to {channel_mention}, press Get VIP, and paste your player_id from hllrecords.com.\n"
+                "Once you claim VIP, your temporary Discord role will be removed automatically."
+            )
+            try:
+                await member.send(dm_message)
+            except discord.Forbidden:
+                logging.info("Cannot DM user %s; DMs disabled or blocked.", member.id)
+            except discord.HTTPException:
+                logging.exception("Failed to send assignvip DM to user %s", member.id)
+
 
 def create_bot(config: AppConfig, vip_service: VipService) -> commands.Bot:
     return FrontlinePassBot(config, vip_service)
