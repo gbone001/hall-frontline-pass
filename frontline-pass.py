@@ -1120,7 +1120,7 @@ class FrontlinePassBot(commands.Bot):
             claim_channel_id = self.config.vip_claim_channel_id or self.config.channel_id
             channel_mention = f"<#{claim_channel_id}>" if claim_channel_id else "the VIP channel"
             announcement = (
-                f"Assigned {role.mention} to {member.mention} at {interaction.user.mention}.\n"
+                f"Assigned {role.mention} to {member.mention} by {interaction.user.mention}.\n"
                 f"Please go to {channel_mention} and press Get VIP, then enter the Player-ID when prompted.\n"
                 "After you claim VIP, your temporary Discord role will be removed automatically."
             )
