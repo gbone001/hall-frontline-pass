@@ -1126,9 +1126,41 @@ class FrontlinePassBot(commands.Bot):
             )
 
             try:
-                await interaction.response.send_message(announcement, ephemeral=False)
+                await interaction.response.defer(ephemeral=True, thinking=False)
+                deferred = True
             except discord.InteractionResponded:
-                # Fall back to a follow-up if a response was already sent earlier in the flow.
+                deferred = False
+
+            sent_in_channel = False
+            destination = interaction.channel
+            if isinstance(destination, MessageableChannel):
+                try:
+                    await destination.send(announcement)
+                    sent_in_channel = True
+                except discord.Forbidden:
+                    logging.info(
+                        "Missing permission to post assignvip announcement in channel %s",
+                        getattr(destination, "id", "unknown"),
+                    )
+                except discord.DiscordException:
+                    logging.exception(
+                        "Failed to post assignvip announcement in channel %s",
+                        getattr(destination, "id", "unknown"),
+                    )
+
+            if deferred:
+                followup_text = (
+                    f"Assigned {role.mention} to {member.mention}. Posted instructions here and notified the player."
+                    if sent_in_channel
+                    else (
+                        "Assigned the role, but I couldn't post instructions in this channel. "
+                        "Please confirm permissions."
+                    )
+                )
+                with contextlib.suppress(discord.DiscordException):
+                    await interaction.followup.send(followup_text, ephemeral=True, wait=False)
+            elif not sent_in_channel:
+                # As a last resort, attempt to deliver the announcement via a follow-up.
                 with contextlib.suppress(discord.DiscordException):
                     await interaction.followup.send(announcement, ephemeral=False, wait=False)
 
