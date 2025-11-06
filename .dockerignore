@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.git/
+.github/
+.devcontainer/
+.env
+.env.dist
+frontline-pass.db
+tests/
+*.pyc

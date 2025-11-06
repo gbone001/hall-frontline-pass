@@ -286,13 +286,13 @@ class AppConfig:
     rcon_version: int
     database_path: str
     database_table: str
-    moderation_channel_id: Optional[int]
-    moderator_role_id: Optional[int]
-    announcement_message_id: Optional[int]
-    http_credentials: Optional[HttpCredentials]
-    crcon_database_url: Optional[str]
-    vip_temp_role_id: Optional[int]
-    vip_claim_channel_id: Optional[int]
+    moderation_channel_id: Optional[int] = None
+    moderator_role_id: Optional[int] = None
+    announcement_message_id: Optional[int] = None
+    http_credentials: Optional[HttpCredentials] = None
+    crcon_database_url: Optional[str] = None
+    vip_temp_role_id: Optional[int] = None
+    vip_claim_channel_id: Optional[int] = None
 
     @property
     def vip_duration_label(self) -> str:

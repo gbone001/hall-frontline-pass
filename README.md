@@ -128,7 +128,7 @@ Admins can refresh the message at any time with `/repost_frontline_controls`.
 ## Deployment Notes
 
 - **Local / bare metal** - run `python frontline-pass.py` under your favorite supervisor (systemd, pm2, tmux). Ensure the working directory is writable so the JSON file can be updated.
-- **Railway** - the repo ships with `Procfile` and `railway.toml`. A persistent volume is mounted at `/data` by default; the bot auto-detects Railway mounts and will store the JSON at `/data/vip-data.json` automatically. You can also set `DATABASE_PATH=/data/vip-data.json` explicitly if you prefer. Configure environment variables through the Railway dashboard or CLI.
+- **Railway** - the repo ships with `Procfile`, `railway.toml`, and a Dockerfile. Railway builds with the Dockerfile (set in `railway.toml`) and runs `python frontline-pass.py`. A persistent volume is mounted at `/data` by default; the bot auto-detects Railway mounts and will store the JSON at `/data/vip-data.json` automatically. Set the required variables (see `.env.dist`) in the Railway dashboard/CLI before deploying—at minimum `DISCORD_TOKEN`, `VIP_DURATION_HOURS`, `CHANNEL_ID`, `LOCAL_TIMEZONE`, `RCON_HOST`, `RCON_PORT`, and `RCON_PASSWORD`.
 
 ## Quick Troubleshooting Checklist
 
