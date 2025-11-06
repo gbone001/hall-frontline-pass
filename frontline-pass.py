@@ -1540,7 +1540,11 @@ class PlayerIDModal(Modal):
         self.notifier = parent_view.notifier
         self.player_id = TextInput(
             label="T17 / Steam ID",
-            placeholder="12345678901234567",
+            placeholder=(
+                "Link your HLL player-id# to your discord account to get the VIP pass. "
+                "Go to https://hllrecords.com/ - and search for your player name. "
+                "Open up your player details and copy the Xbox Game Pass / Epic Games string of numbers into the box below."
+            ),
             custom_id="frontline-pass-player-id-input",
         )
         self.add_item(self.player_id)
