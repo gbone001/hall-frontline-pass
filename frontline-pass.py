@@ -678,6 +678,9 @@ class VipRequestModal(Modal):
             label="T17 / Steam ID",
             placeholder=PLAYER_ID_PLACEHOLDER,
             custom_id="frontline-pass-vip-player-id-input",
+            min_length=32,
+            max_length=32,
+            style=discord.TextStyle.short,
         )
         self.add_item(self.player_id)
 
@@ -728,6 +731,15 @@ class CombinedView(PersistentView):
         steam_id = steam_id.strip()
         if not steam_id:
             await interaction.response.send_message("T17 ID cannot be empty.", ephemeral=True)
+            schedule_ephemeral_cleanup(interaction)
+            return
+
+        steam_id = steam_id.lower()
+        if len(steam_id) != 32:
+            await interaction.response.send_message(
+                "Player-ID must be a 32-character string copied from https://hllrecords.com.",
+                ephemeral=True,
+            )
             schedule_ephemeral_cleanup(interaction)
             return
 
