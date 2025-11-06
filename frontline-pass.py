@@ -28,9 +28,7 @@ logging.basicConfig(level=logging.INFO)
 
 ANNOUNCEMENT_TITLE = "VIP Control Center"
 PLAYER_ID_PLACEHOLDER = (
-    "Link your HLL player-id# to your discord account to get the VIP pass. "
-    "Go to https://hllrecords.com/ - and search for your player name. "
-    "Open up your player details and copy the Xbox Game Pass / Epic Games string of numbers into the box below."
+    "Paste your 32-character player ID from hllrecords.com (e.g. 2805d5bbe14b6ec432f82e5cb859d012)."
 )
 
 
