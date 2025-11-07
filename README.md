@@ -65,6 +65,7 @@ All primary settings live in `config.jsonc` (JSON5 syntax). Environment variable
 | `ANNOUNCEMENT_MESSAGE_ID` | Optional | Reuse an existing Discord message for the control panel. |
 | `MODERATOR_ROLE_ID` | Optional | Discord role ID treated as moderator for privileged commands such as `/assignvip` and `/set_vip_duration`. |
 | `VIP_TEMP_ROLE_ID`, `VIP_CLAIM_CHANNEL_ID` | Optional | Used by `/assignvip`. `VIP_TEMP_ROLE_ID` is a temporary Discord role that grants access to your VIP claim channel. `VIP_CLAIM_CHANNEL_ID` is the channel ID where the control panel lives (falls back to `CHANNEL_ID` if unset). |
+| `VIP_ASSIGN_LIMIT` | Optional | Weekly per-moderator cap for `/assignvip`. Defaults to `5` uses and resets every Monday at 01:00 in `LOCAL_TIMEZONE`. |
 | `COMMAND_GUILD_IDS` / `COMMAND_GUILD_ID` | Optional | Comma-separated guild IDs (or a single ID) to sync slash commands instantly to those servers. If unset, commands are synced globally (may take up to ~1 hour to propagate). |
 | `CRCON_HTTP_BASE_URL` | Yes | CRCON host (omit `/api`; the bot appends it automatically). |
 | `CRCON_HTTP_BEARER_TOKEN` | Yes\* | Pre-generated CRCON token. Required unless you supply username/password. |
@@ -108,6 +109,7 @@ Admins can refresh the message at any time with `/repost_frontline_controls`.
 2. The bot assigns the `VIP_TEMP_ROLE_ID` role to that member and points them to `VIP_CLAIM_CHANNEL_ID` (or `CHANNEL_ID`).
 3. The member presses **Get VIP**, pastes their Player-ID, and submits the modal.
 4. After a successful claim, the bot automatically removes the temporary Discord role so access reverts to normal.
+5. Each moderator can only run `/assignvip` up to `VIP_ASSIGN_LIMIT` times per week (resets Mondays at 01:00 local time). Use `/vipassignlimit` to check your usage or update the cap.
 
 ## Deployment Notes
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -242,10 +243,134 @@ class AppConfig:
     moderator_role_id: Optional[int] = None
     vip_temp_role_id: Optional[int] = None
     vip_claim_channel_id: Optional[int] = None
+    vip_assign_limit: int = 5
 
     @property
     def vip_duration_label(self) -> str:
         return f"{self.vip_duration_hours:g}"
+
+
+@dataclass(frozen=True)
+class VipAssignUsageResult:
+    allowed: bool
+    used: int
+    limit: int
+
+
+class VipAssignLimiter:
+    def __init__(self, timezone: pytz.BaseTzInfo, *, default_limit: int, storage_path: Path) -> None:
+        self._timezone = timezone
+        self._storage_path = storage_path
+        self._lock = asyncio.Lock()
+        self._state: Dict[str, Any] = {
+            "limit": max(int(default_limit), 1),
+            "usage": {},
+            "window_start": None,
+        }
+        self._load_state()
+
+    async def get_limit(self) -> int:
+        async with self._lock:
+            return max(int(self._state.get("limit", 1)), 1)
+
+    async def set_limit(self, new_limit: int) -> int:
+        normalized = max(int(new_limit), 1)
+        async with self._lock:
+            self._state["limit"] = normalized
+            self._save_state()
+            return normalized
+
+    async def try_consume(self, user_id: int) -> VipAssignUsageResult:
+        async with self._lock:
+            now = datetime.now(timezone.utc)
+            if self._ensure_current_window(now):
+                self._save_state()
+            limit = max(int(self._state.get("limit", 1)), 1)
+            usage_map = self._state.setdefault("usage", {})
+            key = str(user_id)
+            current = int(usage_map.get(key, 0))
+            if current >= limit:
+                return VipAssignUsageResult(False, current, limit)
+            usage_map[key] = current + 1
+            self._save_state()
+            return VipAssignUsageResult(True, current + 1, limit)
+
+    async def get_usage(self, user_id: int) -> Tuple[int, int]:
+        async with self._lock:
+            now = datetime.now(timezone.utc)
+            if self._ensure_current_window(now):
+                self._save_state()
+            limit = max(int(self._state.get("limit", 1)), 1)
+            current = int(self._state.get("usage", {}).get(str(user_id), 0))
+            return current, limit
+
+    def _load_state(self) -> None:
+        try:
+            with self._storage_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            return
+        except Exception:
+            logging.exception("Failed to load VIP assign limiter state from %s", self._storage_path)
+            return
+
+        limit = data.get("limit")
+        if not isinstance(limit, int) or limit <= 0:
+            limit = self._state["limit"]
+        usage_raw = data.get("usage") or {}
+        usage: Dict[str, int] = {}
+        if isinstance(usage_raw, dict):
+            for key, value in usage_raw.items():
+                try:
+                    usage[str(key)] = max(int(value), 0)
+                except (TypeError, ValueError):
+                    continue
+        window_start = data.get("window_start")
+        if not isinstance(window_start, str):
+            window_start = None
+
+        self._state = {
+            "limit": limit,
+            "usage": usage,
+            "window_start": window_start,
+        }
+
+    def _save_state(self) -> None:
+        try:
+            self._storage_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._storage_path.open("w", encoding="utf-8") as handle:
+                json.dump(self._state, handle)
+        except Exception:
+            logging.exception("Failed to persist VIP assign limiter state to %s", self._storage_path)
+
+    def _ensure_current_window(self, now: datetime) -> bool:
+        current_start = self._current_window_start(now)
+        stored = self._parse_datetime(self._state.get("window_start"))
+        if not stored or stored.astimezone(self._timezone) != current_start:
+            self._state["window_start"] = current_start.isoformat()
+            self._state["usage"] = {}
+            return True
+        return False
+
+    def _current_window_start(self, now: datetime) -> datetime:
+        localized = now.astimezone(self._timezone)
+        start_of_week = localized - timedelta(days=localized.weekday())
+        start_of_week = start_of_week.replace(hour=1, minute=0, second=0, microsecond=0)
+        if localized < start_of_week:
+            start_of_week -= timedelta(days=7)
+        return start_of_week
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> Optional[datetime]:
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
 
 
 def load_config() -> AppConfig:
@@ -360,6 +485,13 @@ def load_config() -> AppConfig:
     moderator_role_id = optional_int("MODERATOR_ROLE_ID")
     vip_temp_role_id = optional_int("VIP_TEMP_ROLE_ID")
     vip_claim_channel_id = optional_int("VIP_CLAIM_CHANNEL_ID")
+    vip_assign_limit_raw = optional_int("VIP_ASSIGN_LIMIT")
+    if vip_assign_limit_raw is None:
+        vip_assign_limit = 5
+    else:
+        vip_assign_limit = vip_assign_limit_raw
+    if vip_assign_limit <= 0:
+        errors.append("VIP_ASSIGN_LIMIT must be greater than zero")
 
     http_base_url_raw = get_value("CRCON_HTTP_BASE_URL")
     http_bearer_token = get_value("CRCON_HTTP_BEARER_TOKEN")
@@ -419,6 +551,7 @@ def load_config() -> AppConfig:
         moderator_role_id=moderator_role_id,
         vip_temp_role_id=vip_temp_role_id,
         vip_claim_channel_id=vip_claim_channel_id,
+        vip_assign_limit=vip_assign_limit,
     )
 
 
@@ -842,6 +975,12 @@ class FrontlinePassBot(commands.Bot):
         self.persistent_view: Optional[CombinedView] = None
         self._vip_duration_hours = config.vip_duration_hours
         self._last_grant_utc: Optional[datetime] = None
+        limiter_state_path = Path(__file__).resolve().with_name("vip_assign_usage.json")
+        self.vip_assign_limiter = VipAssignLimiter(
+            config.timezone,
+            default_limit=config.vip_assign_limit,
+            storage_path=limiter_state_path,
+        )
 
     @property
     def vip_duration_hours(self) -> float:
@@ -1039,6 +1178,52 @@ class FrontlinePassBot(commands.Bot):
             schedule_ephemeral_cleanup(interaction)
 
         @self.tree.command(
+            name="vipassignlimit",
+            description="View or update the weekly /assignvip usage limit.",
+        )
+        @app_commands.describe(limit="Optional new weekly limit per moderator (>=1)")
+        async def vipassignlimit(interaction: discord.Interaction, limit: Optional[int] = None) -> None:
+            if not self._user_has_moderator_privileges(interaction.user):
+                await interaction.response.send_message(
+                    "You need moderator permissions to use this command.",
+                    ephemeral=True,
+                )
+                schedule_ephemeral_cleanup(interaction)
+                return
+
+            if limit is None:
+                used, current_limit = await self.vip_assign_limiter.get_usage(interaction.user.id)
+                await interaction.response.send_message(
+                    (
+                        f"VIPAssignLimit is currently {current_limit} uses per moderator each week.\n"
+                        f"You have used {used} time(s) this week. Resets Monday 01:00 {self.config.timezone_name}."
+                    ),
+                    ephemeral=True,
+                )
+                schedule_ephemeral_cleanup(interaction)
+                return
+
+            if limit <= 0:
+                await interaction.response.send_message(
+                    "VIPAssignLimit must be at least 1 use per week.",
+                    ephemeral=True,
+                )
+                schedule_ephemeral_cleanup(interaction)
+                return
+
+            await interaction.response.defer(ephemeral=True)
+            updated_limit = await self.vip_assign_limiter.set_limit(limit)
+            followup_message = await interaction.followup.send(
+                (
+                    f"VIPAssignLimit updated to {updated_limit} uses per moderator each week. "
+                    f"Resets Monday 01:00 {self.config.timezone_name}."
+                ),
+                ephemeral=True,
+                wait=True,
+            )
+            schedule_ephemeral_cleanup(interaction, message=followup_message)
+
+        @self.tree.command(
             name="health",
             description="Show bot health information.",
         )
@@ -1067,6 +1252,15 @@ class FrontlinePassBot(commands.Bot):
             if not self._user_has_moderator_privileges(interaction.user):
                 await interaction.response.send_message(
                     "You need moderator permissions to use this command.",
+                    ephemeral=True,
+                )
+                schedule_ephemeral_cleanup(interaction)
+                return
+
+            usage_result = await self.vip_assign_limiter.try_consume(interaction.user.id)
+            if not usage_result.allowed:
+                await interaction.response.send_message(
+                    "Weekly limit reached - reset each Monday",
                     ephemeral=True,
                 )
                 schedule_ephemeral_cleanup(interaction)
