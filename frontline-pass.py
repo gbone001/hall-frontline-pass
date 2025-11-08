@@ -748,6 +748,38 @@ class VipHttpClient:
             raise VipHTTPError(f"add_vip reported failure: {data.get('error') or data}")
         return data
 
+    def get_player_profile(
+        self,
+        player_id: str,
+        *,
+        num_sessions: int = 10,
+    ) -> Dict[str, Any]:
+        query_params = {
+            "player_id": player_id,
+            "num_sessions": num_sessions,
+        }
+        try:
+            response = self._request_with_reauth(
+                "GET",
+                "get_player_profile",
+                query_params=query_params,
+            )
+        except requests.exceptions.RequestException as exc:
+            raise VipHTTPError(f"HTTP API request failed: {exc}") from exc
+
+        if response.status_code != 200:
+            raise VipHTTPError(
+                f"get_player_profile failed with status {response.status_code}: {response.text}"
+            )
+
+        data = self._parse_json(response)
+        if data.get("failed"):
+            raise VipHTTPError(f"get_player_profile reported failure: {data.get('error') or data}")
+        result = data.get("result") or {}
+        if not isinstance(result, dict):
+            raise VipHTTPError("get_player_profile returned an unexpected result format.")
+        return result
+
     @staticmethod
     def _parse_json(response: requests.Response) -> Dict[str, Any]:
         try:
@@ -763,6 +795,8 @@ class VipHttpClient:
 class VipGrantResult:
     status_lines: List[str]
     detail: str
+    expiration_local: datetime
+    expiration_utc: datetime
 
 
 class VipService:
@@ -774,11 +808,18 @@ class VipService:
     def grant_vip(
         self,
         player_id: str,
-        comment: str,
-        expiration_iso: Optional[str],
+        duration_hours: float,
+        local_timezone: pytz.BaseTzInfo,
+        requester_display_name: str,
         *,
         player_name: Optional[str] = None,
     ) -> VipGrantResult:
+        expiration_utc = self._determine_extended_expiration(player_id, duration_hours)
+        expiration_local = expiration_utc.astimezone(local_timezone)
+        expiration_iso = expiration_utc.isoformat()
+        comment = (
+            f"Discord VIP for {requester_display_name} until {expiration_utc:%Y-%m-%d %H:%M:%S} UTC"
+        )
         response = self._http_client.add_vip(
             player_id,
             comment,
@@ -791,7 +832,60 @@ class VipService:
         if message is None:
             message = "HTTP API add_vip succeeded."
         detail = str(message)
-        return VipGrantResult(status_lines=[f"HTTP API: {detail}"], detail=detail)
+        return VipGrantResult(
+            status_lines=[f"HTTP API: {detail}"],
+            detail=detail,
+            expiration_local=expiration_local,
+            expiration_utc=expiration_utc,
+        )
+
+    def _determine_extended_expiration(
+        self,
+        player_id: str,
+        duration_hours: float,
+    ) -> datetime:
+        profile = self._http_client.get_player_profile(player_id, num_sessions=10)
+        latest_expiration = self._extract_latest_vip_expiration(profile)
+        base = self._now_utc()
+        if latest_expiration and latest_expiration > base:
+            base = latest_expiration
+        return base + timedelta(hours=duration_hours)
+
+    def _now_utc(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _extract_latest_vip_expiration(profile: Dict[str, Any]) -> Optional[datetime]:
+        vips = profile.get("vips") if isinstance(profile, dict) else None
+        if not isinstance(vips, list):
+            return None
+        latest: Optional[datetime] = None
+        for entry in vips:
+            if not isinstance(entry, dict):
+                continue
+            expiration_str = entry.get("expiration")
+            expiration_dt = VipService._parse_iso_datetime(expiration_str)
+            if expiration_dt is None:
+                continue
+            expiration_utc = expiration_dt.astimezone(timezone.utc)
+            if latest is None or expiration_utc > latest:
+                latest = expiration_utc
+        return latest
+
+    @staticmethod
+    def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        if normalized.endswith("Z"):
+            normalized = f"{normalized[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
 
 
 class VipRequestModal(Modal):
@@ -881,20 +975,14 @@ class CombinedView(PersistentView):
         player_display_name: Optional[str] = None,
     ) -> None:
         duration_hours = self.bot.vip_duration_hours
-        local_time = datetime.now(self.config.timezone)
-        expiration_time_local = local_time + timedelta(hours=duration_hours)
-        expiration_time_utc = expiration_time_local.astimezone(pytz.utc)
-        expiration_time_iso = expiration_time_utc.isoformat()
-        comment = (
-            f"Discord VIP for {interaction.user.display_name} until {expiration_time_utc:%Y-%m-%d %H:%M:%S} UTC"
-        )
 
         try:
             result = await asyncio.to_thread(
                 self.vip_service.grant_vip,
                 steam_id,
-                comment,
-                expiration_time_iso,
+                duration_hours,
+                self.config.timezone,
+                interaction.user.display_name,
                 player_name=player_display_name,
             )
         except VipHTTPError as exc:
@@ -916,11 +1004,11 @@ class CombinedView(PersistentView):
             schedule_ephemeral_cleanup(interaction, message=followup_message)
             return
 
-        readable_expiration = expiration_time_local.strftime("%Y-%m-%d %H:%M:%S %Z")
+        readable_expiration = result.expiration_local.strftime("%Y-%m-%d %H:%M:%S %Z")
         logging.info(
             "Granted VIP for player %s until %s UTC (%s)",
             steam_id,
-            expiration_time_utc.strftime("%Y-%m-%d %H:%M:%S"),
+            result.expiration_utc.strftime("%Y-%m-%d %H:%M:%S"),
             "; ".join(result.status_lines),
         )
         self.bot.record_vip_grant(datetime.now(timezone.utc))

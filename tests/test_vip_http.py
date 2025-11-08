@@ -1,6 +1,7 @@
 import importlib.util
 import pathlib
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import pytz
@@ -58,7 +59,7 @@ class DummySession:
                 self.cookies.set(key, value)
         return response
 
-    def request(self, method, url, json=None, headers=None, timeout=None):
+    def request(self, method, url, json=None, headers=None, timeout=None, params=None):
         self.calls.append(
             {
                 "method": method,
@@ -66,12 +67,13 @@ class DummySession:
                 "json": json,
                 "headers": headers,
                 "timeout": timeout,
+                "params": params,
             }
         )
         return self._next_response()
 
-    def post(self, url, json=None, headers=None, timeout=None):
-        return self.request("POST", url, json=json, headers=headers, timeout=timeout)
+    def post(self, url, json=None, headers=None, timeout=None, params=None):
+        return self.request("POST", url, json=json, headers=headers, timeout=timeout, params=params)
 
 
 class VipHttpClientTests(unittest.TestCase):
@@ -174,6 +176,38 @@ class VipHttpClientTests(unittest.TestCase):
         self.assertEqual(session.calls[1]["url"], "https://example/api/add_vip")
         self.assertEqual(session.calls[1]["headers"]["Referer"], "https://example")
 
+    def test_get_player_profile_fetches_profile(self) -> None:
+        session = DummySession(DummyResponse(200, {"result": {"player_id": "player-id"}}))
+        client = VipHttpClient(
+            HttpCredentials(base_url="https://example/api", bearer_token="abc123"),
+            session=session,
+        )
+
+        profile = client.get_player_profile("player-id")
+
+        self.assertEqual(profile["player_id"], "player-id")
+        self.assertEqual(len(session.calls), 1)
+        call = session.calls[0]
+        self.assertEqual(call["method"], "GET")
+        self.assertEqual(call["url"], "https://example/api/get_player_profile")
+        self.assertEqual(
+            call["params"],
+            {
+                "player_id": "player-id",
+                "num_sessions": 10,
+            },
+        )
+
+    def test_get_player_profile_raises_on_failure(self) -> None:
+        session = DummySession(DummyResponse(403, {"result": None, "error": "nope"}))
+        client = VipHttpClient(
+            HttpCredentials(base_url="https://example/api", bearer_token="abc123"),
+            session=session,
+        )
+
+        with self.assertRaises(VipHTTPError):
+            client.get_player_profile("player-id")
+
 
 class VipServiceTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -192,28 +226,80 @@ class VipServiceTests(unittest.TestCase):
     def test_grant_vip_uses_http_client(self) -> None:
         service = VipService(self.config)
         fake_http_client = mock.Mock()
+        fake_http_client.get_player_profile.return_value = {}
         fake_http_client.add_vip.return_value = {"result": "ok"}
         service._http_client = fake_http_client  # type: ignore[attr-defined]
+        fixed_now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        service._now_utc = mock.Mock(return_value=fixed_now)  # type: ignore[attr-defined]
 
-        result = service.grant_vip("steam123", "comment", None)
+        result = service.grant_vip(
+            "steam123",
+            duration_hours=4,
+            local_timezone=pytz.UTC,
+            requester_display_name="GBONE",
+        )
 
         fake_http_client.add_vip.assert_called_once()
         args, kwargs = fake_http_client.add_vip.call_args
-        self.assertEqual(args[:3], ("steam123", "comment", None))
+        fake_http_client.get_player_profile.assert_called_once_with("steam123", num_sessions=10)
+        expected_expiration = fixed_now + timedelta(hours=4)
+        self.assertEqual(args[0], "steam123")
+        self.assertIn("Discord VIP for GBONE", args[1])
+        self.assertEqual(args[2], expected_expiration.isoformat())
         self.assertIsNone(kwargs.get("player_name"))
         self.assertIn("HTTP API", result.status_lines[0])
+        self.assertEqual(result.expiration_utc, expected_expiration)
+        self.assertEqual(result.expiration_local, expected_expiration)
 
     def test_grant_vip_forwards_player_name(self) -> None:
         service = VipService(self.config)
         fake_http_client = mock.Mock()
+        fake_http_client.get_player_profile.return_value = {}
         fake_http_client.add_vip.return_value = {"result": "ok"}
         service._http_client = fake_http_client  # type: ignore[attr-defined]
+        service._now_utc = mock.Mock(return_value=datetime(2030, 1, 1, tzinfo=timezone.utc))  # type: ignore[attr-defined]
 
-        service.grant_vip("steam123", "comment", None, player_name="GBONE001")
+        service.grant_vip(
+            "steam123",
+            duration_hours=1,
+            local_timezone=pytz.UTC,
+            requester_display_name="GBONE",
+            player_name="GBONE001",
+        )
 
         fake_http_client.add_vip.assert_called_once()
         _, kwargs = fake_http_client.add_vip.call_args
         self.assertEqual(kwargs.get("player_name"), "GBONE001")
+
+    def test_grant_vip_extends_existing_expiration(self) -> None:
+        service = VipService(self.config)
+        fake_http_client = mock.Mock()
+        fake_http_client.get_player_profile.return_value = {
+            "vips": [
+                {"expiration": "2031-01-01T00:00:00+00:00"},
+                {"expiration": "2030-12-01T00:00:00+00:00"},
+            ]
+        }
+        fake_http_client.add_vip.return_value = {"result": "ok"}
+        service._http_client = fake_http_client  # type: ignore[attr-defined]
+        service._now_utc = mock.Mock(return_value=datetime(2030, 6, 1, tzinfo=timezone.utc))  # type: ignore[attr-defined]
+        local_tz = pytz.timezone("Australia/Sydney")
+
+        result = service.grant_vip(
+            "steam123",
+            duration_hours=2,
+            local_timezone=local_tz,
+            requester_display_name="GBONE",
+        )
+
+        base = datetime.fromisoformat("2031-01-01T00:00:00+00:00")
+        expected_expiration = base + timedelta(hours=2)
+        self.assertEqual(result.expiration_utc, expected_expiration)
+        self.assertEqual(result.expiration_local, expected_expiration.astimezone(local_tz))
+        self.assertEqual(
+            fake_http_client.add_vip.call_args[0][2],
+            expected_expiration.isoformat(),
+        )
 
 
 if __name__ == "__main__":
