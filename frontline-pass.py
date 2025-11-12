@@ -798,6 +798,14 @@ class VipGrantResult:
     expiration_local: datetime
     expiration_utc: datetime
 
+@dataclass(frozen=True)
+class PlayerVipStatus:
+    player_id: str
+    expiration_utc: Optional[datetime]
+
+    def is_active(self, reference: datetime) -> bool:
+        return bool(self.expiration_utc and self.expiration_utc > reference)
+
 
 class VipService:
     def __init__(self, config: AppConfig) -> None:
@@ -838,6 +846,11 @@ class VipService:
             expiration_local=expiration_local,
             expiration_utc=expiration_utc,
         )
+
+    def get_player_vip_status(self, player_id: str) -> PlayerVipStatus:
+        profile = self._http_client.get_player_profile(player_id, num_sessions=10)
+        expiration_utc = self._extract_latest_vip_expiration(profile)
+        return PlayerVipStatus(player_id=player_id, expiration_utc=expiration_utc)
 
     def _determine_extended_expiration(
         self,
@@ -1264,6 +1277,48 @@ class FrontlinePassBot(commands.Bot):
                 ephemeral=True,
             )
             schedule_ephemeral_cleanup(interaction)
+
+        @self.tree.command(
+            name="show_player_vip",
+            description="Show a player's current VIP status and expiration via the HTTP API.",
+        )
+        @app_commands.describe(player_id="Player ID string from https://hllrecords.com")
+        async def show_player_vip(interaction: discord.Interaction, player_id: str) -> None:
+            await interaction.response.defer(ephemeral=True)
+            now = datetime.now(timezone.utc)
+            try:
+                status = self.vip_service.get_player_vip_status(player_id)
+            except VipHTTPError as exc:
+                followup_message = await interaction.followup.send(
+                    f"Unable to fetch VIP status for {player_id}: {exc}",
+                    ephemeral=True,
+                    wait=True,
+                )
+                schedule_ephemeral_cleanup(interaction, message=followup_message)
+                return
+
+            if status.expiration_utc:
+                expiration_local = status.expiration_utc.astimezone(self.config.timezone)
+                formatted = expiration_local.strftime("%Y-%m-%d %H:%M:%S %Z")
+                if status.expiration_utc > now:
+                    body = (
+                        f"{player_id} currently has VIP access until {formatted} "
+                        f"({self.config.timezone_name})."
+                    )
+                else:
+                    body = (
+                        f"{player_id} last had VIP access until {formatted} "
+                        f"({self.config.timezone_name}); it has expired."
+                    )
+            else:
+                body = f"No VIP records found for {player_id}."
+
+            followup_message = await interaction.followup.send(
+                body,
+                ephemeral=True,
+                wait=True,
+            )
+            schedule_ephemeral_cleanup(interaction, message=followup_message)
 
         @self.tree.command(
             name="vipassignlimit",

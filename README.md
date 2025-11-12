@@ -111,6 +111,10 @@ Admins can refresh the message at any time with `/repost_frontline_controls`.
 4. After a successful claim, the bot automatically removes the temporary Discord role so access reverts to normal.
 5. Each moderator can only run `/assignvip` up to `VIP_ASSIGN_LIMIT` times per week (resets Mondays at 01:00 local time). Use `/vipassignlimit` to check your usage or update the cap.
 
+### Check a player's VIP status
+
+Use `/show_player_vip` and paste the Player ID string that you can copy from [https://hllrecords.com](https://hllrecords.com). The bot calls the CRCON HTTP API and replies with the current VIP status and the expiration time rendered in your configured local timezone.
+
 ## Deployment Notes
 
 - **Local / bare metal** - run `python frontline-pass.py` under your favorite supervisor (systemd, pm2, tmux).

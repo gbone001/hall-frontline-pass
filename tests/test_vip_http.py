@@ -301,6 +301,33 @@ class VipServiceTests(unittest.TestCase):
             expected_expiration.isoformat(),
         )
 
+    def test_get_player_vip_status_returns_expiration(self) -> None:
+        service = VipService(self.config)
+        fake_http_client = mock.Mock()
+        fake_http_client.get_player_profile.return_value = {
+            "vips": [
+                {"expiration": "2032-05-01T10:00:00+00:00"},
+            ]
+        }
+        service._http_client = fake_http_client  # type: ignore[attr-defined]
+
+        status = service.get_player_vip_status("steam123")
+
+        self.assertEqual(status.player_id, "steam123")
+        self.assertEqual(status.expiration_utc, datetime.fromisoformat("2032-05-01T10:00:00+00:00"))
+        fake_http_client.get_player_profile.assert_called_once_with("steam123", num_sessions=10)
+
+    def test_get_player_vip_status_handles_missing_entries(self) -> None:
+        service = VipService(self.config)
+        fake_http_client = mock.Mock()
+        fake_http_client.get_player_profile.return_value = {}
+        service._http_client = fake_http_client  # type: ignore[attr-defined]
+
+        status = service.get_player_vip_status("steam123")
+
+        self.assertEqual(status.player_id, "steam123")
+        self.assertIsNone(status.expiration_utc)
+
 
 if __name__ == "__main__":
     unittest.main()
